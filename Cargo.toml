@@ -3,6 +3,8 @@ name = "vmmbox"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-only"
+description = "Accelerated Linux VMs on QEMU that mirror your user and share your home"
+repository = "https://github.com/ericcurtin/vmmbox"
 
 [dependencies]
 anyhow = "1.0.104"

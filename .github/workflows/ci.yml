@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+  packaging:
+    name: Packaging
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: shellcheck
+        run: shellcheck packaging/render.sh
+
+      # Render with made-up hashes: catches template/script drift (a leftover
+      # placeholder, a renamed asset) on every change instead of at release time.
+      - name: Render the packages
+        run: |
+          for asset in vmmbox-aarch64-apple-darwin vmmbox-x86_64-apple-darwin \
+                       vmmbox-x86_64-unknown-linux-musl vmmbox-x86_64-pc-windows-msvc.exe; do
+            printf '%s  %s\n' "$(printf '%s' "$asset" | sha256sum | cut -d' ' -f1)" "$asset"
+          done > checksums.txt
+          packaging/render.sh --version 0.0.1 --checksums checksums.txt --out-dir rendered
+
+      - name: Validate the rendered files
+        run: |
+          jq -e '.version == "0.0.1" and .bin == "vmmbox.exe"' rendered/scoop/bucket/vmmbox.json
+          ruby -c rendered/homebrew/Formula/vmmbox.rb
+          ! grep -rn '@[A-Z_]\{2,\}@' rendered
