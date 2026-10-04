@@ -189,7 +189,16 @@ impl Gui {
         if tty {
             cmd.arg("-t");
         }
-        let result = cmd.arg(ssh.target()).arg(remote).status();
+        let mut session = cmd
+            .arg(ssh.target())
+            .arg(remote)
+            .spawn()
+            .context("running ssh")?;
+        // If we are terminated mid-session, take the client and the session
+        // down with us rather than leave them behind.
+        let ending = EndWithUs::new(&[client.id(), session.id()]);
+        let result = session.wait();
+        drop(ending);
 
         // The client keeps listening for more connections; it ends with the
         // session.
@@ -210,6 +219,73 @@ impl Gui {
         _x11: bool,
     ) -> Result<i32> {
         bail!("GUI apps are not supported on this host yet")
+    }
+}
+
+/// Processes to kill if this one is terminated while a GUI session runs.
+#[cfg(unix)]
+static ENDING: [std::sync::atomic::AtomicI32; 2] = [
+    std::sync::atomic::AtomicI32::new(0),
+    std::sync::atomic::AtomicI32::new(0),
+];
+
+/// Signals that end us without any cleanup running. Ctrl-C is not here: the
+/// terminal sends it to our children as well.
+#[cfg(unix)]
+const END_SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
+
+/// For the life of the value, a SIGTERM or SIGHUP to this process also kills
+/// the given child processes. Without it they would outlive us: ssh keeps the
+/// guest app running, and the waypipe client keeps listening forever. (SIGKILL
+/// cannot be caught, so it still leaves them.)
+#[cfg(unix)]
+struct EndWithUs;
+
+#[cfg(unix)]
+impl EndWithUs {
+    fn new(pids: &[u32; 2]) -> Self {
+        use std::sync::atomic::Ordering::SeqCst;
+        for (slot, pid) in ENDING.iter().zip(pids) {
+            slot.store(*pid as i32, SeqCst);
+        }
+        for sig in END_SIGNALS {
+            // SAFETY: the handler only makes async-signal-safe calls.
+            unsafe { libc::signal(sig, end_with_us as extern "C" fn(libc::c_int) as usize) };
+        }
+        Self
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EndWithUs {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        for sig in END_SIGNALS {
+            // SAFETY: restoring the default action.
+            unsafe { libc::signal(sig, libc::SIG_DFL) };
+        }
+        for slot in &ENDING {
+            slot.store(0, SeqCst);
+        }
+    }
+}
+
+/// Kill what we were asked to take with us, then die of the same signal so the
+/// exit status is what it would have been. Only async-signal-safe calls.
+#[cfg(unix)]
+extern "C" fn end_with_us(sig: libc::c_int) {
+    use std::sync::atomic::Ordering::SeqCst;
+    for slot in &ENDING {
+        let pid = slot.load(SeqCst);
+        if pid > 0 {
+            // SAFETY: kill is async-signal-safe.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+    // SAFETY: signal and raise are async-signal-safe.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
     }
 }
 
@@ -667,6 +743,50 @@ mod script_tests {
         assert!(!cands(&["sh", "-c", "if true; then foot; fi"]).contains(&"then".to_string()));
         // An unresolvable expansion is not guessed at.
         assert!(cands(&["sh", "-c", "$BROWSER"]).is_empty());
+    }
+
+    /// Fork, and in the child install the guard, then send ourselves `sig`.
+    /// Returns how the child ended, and whether the helper process it was
+    /// protecting is gone.
+    fn terminate_a_guarded_child(sig: libc::c_int) -> (libc::c_int, bool) {
+        let mut helper = Command::new("sleep").arg("60").spawn().unwrap();
+        let helper_pid = helper.id();
+        // SAFETY: the child only touches atomics and makes async-signal-safe
+        // calls before it ends, so forking from a threaded test is sound.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let _guard = EndWithUs::new(&[helper_pid, 0]);
+            unsafe {
+                libc::raise(sig);
+                libc::_exit(99) // reached only if the signal did nothing
+            }
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let mut gone = false;
+        for _ in 0..50 {
+            if helper.try_wait().unwrap().is_some() {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = helper.kill();
+        let _ = helper.wait();
+        (status, gone)
+    }
+
+    #[test]
+    fn a_terminated_vmmbox_takes_its_helpers_down_and_still_dies_of_the_signal() {
+        for sig in [libc::SIGTERM, libc::SIGHUP] {
+            let (status, gone) = terminate_a_guarded_child(sig);
+            assert!(
+                libc::WIFSIGNALED(status),
+                "signal {sig}: exited normally ({status})"
+            );
+            assert_eq!(libc::WTERMSIG(status), sig, "died of another signal");
+            assert!(gone, "signal {sig}: the helper outlived the process");
+        }
     }
 
     #[test]
