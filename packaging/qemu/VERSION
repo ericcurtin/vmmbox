@@ -1,0 +1,10 @@
+# The QEMU that vmmbox ships. Sourced by build.sh and read by CI.
+#
+# vmmbox builds UNMODIFIED upstream QEMU: no patches, no fork. The only inputs
+# are this release tarball and the configure flags in build.sh. Bump
+# BUNDLE_REV when only the build recipe changes.
+QEMU_VERSION=11.1.2
+QEMU_URL=https://download.qemu.org/qemu-11.1.2.tar.xz
+# Cross-checked against the checksum Homebrew records for the same tarball.
+QEMU_SHA256=731b5681e4bb18be313231579b8efd0296c5b015fa36dc533874b639ba838016
+BUNDLE_REV=1
