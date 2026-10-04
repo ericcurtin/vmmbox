@@ -283,14 +283,16 @@ impl Qemu {
     }
 
     /// Whether this build can attach a virtio-fs device, which needs vhost-user
-    /// and the shared-memory RAM backend. Homebrew's QEMU has neither on macOS;
-    /// the build vmmbox ships has both.
-    pub fn supports_virtiofs(&self) -> bool {
+    /// and a RAM backend that can be shared with the server. Distribution QEMUs
+    /// on Linux have both; Homebrew's has neither on macOS, and the build vmmbox
+    /// ships has both.
+    pub fn supports_virtiofs(&self, os: Os) -> bool {
+        let backend = ram_backend(os);
         self.has_device("vhost-user-fs-pci")
             && self
                 .run_help(&["-object", "help"])
                 .lines()
-                .any(|l| l.trim() == "memory-backend-shm")
+                .any(|l| l.trim() == backend)
     }
 
     /// How to give the guest a host-accelerated GPU, or why it gets none.
@@ -439,6 +441,14 @@ pub fn prepare_efi_vars(template: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The QEMU object that makes guest RAM shareable with the virtio-fs server.
+fn ram_backend(os: Os) -> &'static str {
+    match os {
+        Os::Linux => "memory-backend-memfd",
+        _ => "memory-backend-shm",
+    }
+}
+
 /// How the host home is attached to the guest. See `share.rs`.
 #[derive(Clone, Copy, Debug)]
 pub enum HomeShare<'a> {
@@ -585,10 +595,15 @@ pub fn build_args(l: &Launch) -> Result<Vec<String>> {
             );
         }
         Some(HomeShare::VirtioFs { socket }) => {
-            // The server (`vmmbox virtiofsd`) is already listening on `socket`.
+            // The server is already listening on `socket`. Its RAM is shared as
+            // memfd on Linux and POSIX shm on macOS, which has no memfd.
             a.kv(
                 "-object",
-                format!("memory-backend-shm,id=mem0,size={}M,share=on", l.memory_mib),
+                format!(
+                    "{},id=mem0,size={}M,share=on",
+                    ram_backend(l.platform.os),
+                    l.memory_mib
+                ),
             );
             a.kv("-chardev", format!("socket,id=vfs,path={}", path(socket)));
             a.kv(
@@ -802,6 +817,29 @@ mod tests {
         assert!(has_pair(&args, "-m", "32768"));
         // And none of 9p.
         assert!(!args.iter().any(|a| a.contains("9p") || a.contains("fsdev")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_linux_the_shared_ram_is_memfd() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        };
+        let share = HomeShare::VirtioFs {
+            socket: Path::new("/run/user/1000/vmmbox/ubuntu.vfs.sock"),
+        };
+        let mut l = launch(platform, &ep, Some(share));
+        l.efi = None;
+        let args = build_args(&l).unwrap();
+        assert!(has_pair(&args, "-machine", "q35,memory-backend=mem0"));
+        assert!(has_pair(
+            &args,
+            "-object",
+            "memory-backend-memfd,id=mem0,size=32768M,share=on"
+        ));
+        assert!(!args.iter().any(|a| a.contains("memory-backend-shm")));
     }
 
     #[cfg(unix)]

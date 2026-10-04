@@ -317,14 +317,15 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
     let share = if !vm.state.home_shared {
         None
     } else if vm.state.home_transport == Transport::VirtioFs {
-        if !qemu.supports_virtiofs() {
+        if !qemu.supports_virtiofs(platform.os) || !fsd::available(platform) {
             bail!(
-                "{name} shares your home over virtio-fs, which needs the QEMU that vmmbox \
-                 installs (`vmmbox setup`); {} cannot do it",
-                qemu.system.display()
+                "{name} shares your home over virtio-fs, which this machine cannot serve \
+                 with {}: {}",
+                qemu.system.display(),
+                fsd::install_hint(platform.os)
             );
         }
-        let (pid, socket) = fsd::start(paths, vm, &host_home)?;
+        let (pid, socket) = fsd::start(paths, vm, &host_home, platform.os)?;
         fsd.started = Some((pid, socket.clone()));
         vm.state.fsd_pid = Some(pid);
         vfs_socket = socket;

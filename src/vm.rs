@@ -5,6 +5,7 @@
 //! so re-pulling or deleting the image never affects an existing VM.
 
 use crate::cloudinit::Seed;
+use crate::fsd;
 use crate::host::{HostUser, Platform};
 use crate::image::ImageMeta;
 use crate::paths::Paths;
@@ -217,7 +218,7 @@ fn build(
         let support = share::Support {
             // The guest kernel must have 9p as well as the host QEMU.
             ninep: qemu.supports_9p() && family.has_9p(),
-            virtiofs: qemu.supports_virtiofs(),
+            virtiofs: qemu.supports_virtiofs(platform.os) && fsd::available(platform),
         };
         let forced = std::env::var("VMMBOX_SHARE").ok();
         let chosen = share::choose(platform.os, support, forced.as_deref());
@@ -228,8 +229,8 @@ fn build(
                 if forced.is_some() {
                     " the way VMMBOX_SHARE asks"
                 } else if !family.has_9p() {
-                    " (this guest's kernel has no 9p, and virtio-fs needs the QEMU that \
-                     `vmmbox setup` installs)"
+                    " (this guest's kernel has no 9p, and virtio-fs is not available here: \
+                     see `vmmbox start` on a machine that has it)"
                 } else {
                     " (no virtio-9p or virtio-fs)"
                 },

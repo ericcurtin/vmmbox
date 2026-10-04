@@ -58,10 +58,11 @@ pub struct Support {
 /// Pick a transport for a new VM, or `None` if the home cannot be shared.
 /// `forced` is `VMMBOX_SHARE`, for testing or for working around a problem.
 ///
-/// virtio-fs is preferred where there is a server for it (macOS): it is faster,
-/// and it is the only one the RHEL-family kernels have.
+/// virtio-fs is preferred wherever there is a server for it (`support.virtiofs`
+/// covers both the QEMU and the server): it is faster, and it is the only one
+/// the RHEL-family kernels have.
 pub fn choose(os: Os, support: Support, forced: Option<&str>) -> Option<Transport> {
-    let virtiofs = os == Os::Mac && support.virtiofs;
+    let virtiofs = os != Os::Windows && support.virtiofs;
     match forced {
         Some("9p") => support.ninep.then_some(Transport::NineP),
         Some("virtiofs") => virtiofs.then_some(Transport::VirtioFs),
@@ -90,10 +91,11 @@ mod tests {
             ninep: true,
             virtiofs: false,
         };
-        // Homebrew's QEMU has no vhost-user.
+        // Homebrew's QEMU has no vhost-user; Linux without virtiofsd installed.
         assert_eq!(choose(Os::Mac, no_vfs, None), Some(Transport::NineP));
-        // Nothing serves virtio-fs on Linux, however capable the QEMU is.
-        assert_eq!(choose(Os::Linux, BOTH, None), Some(Transport::NineP));
+        assert_eq!(choose(Os::Linux, no_vfs, None), Some(Transport::NineP));
+        // With both, Linux takes virtio-fs as macOS does.
+        assert_eq!(choose(Os::Linux, BOTH, None), Some(Transport::VirtioFs));
     }
 
     #[test]
@@ -114,7 +116,12 @@ mod tests {
             Some(Transport::VirtioFs)
         );
         // Asking for what cannot work is no share, not a quiet substitution.
-        assert_eq!(choose(Os::Linux, BOTH, Some("virtiofs")), None);
+        let no_vfs = Support {
+            ninep: true,
+            virtiofs: false,
+        };
+        assert_eq!(choose(Os::Linux, no_vfs, Some("virtiofs")), None);
+        assert_eq!(choose(Os::Windows, BOTH, Some("virtiofs")), None);
         // An unknown value is ignored.
         assert_eq!(
             choose(Os::Mac, BOTH, Some("nfs")),

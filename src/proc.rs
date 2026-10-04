@@ -43,8 +43,9 @@ fn with_process<T>(pid: u32, f: impl FnOnce(&sysinfo::Process) -> T) -> Option<T
     sys.process(pid).map(f)
 }
 
-/// Terminate `pid` if it is a `vmmbox virtiofsd`. The command line is checked,
-/// not just the name, so a pid reused by some other `vmmbox` invocation (a
+/// Terminate `pid` if it is a virtio-fs server: `virtiofsd` itself (Linux) or
+/// `vmmbox virtiofsd` (macOS). For the latter the command line is checked, not
+/// just the name, so a pid reused by some other `vmmbox` invocation (a
 /// concurrent `vmmbox run`, say) is left alone.
 pub fn kill_virtiofsd(pid: u32) -> bool {
     let pid = Pid::from_u32(pid);
@@ -55,9 +56,9 @@ pub fn kill_virtiofsd(pid: u32) -> bool {
         ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
     );
     sys.process(pid).is_some_and(|p| {
-        p.name().to_string_lossy().contains("vmmbox")
-            && p.cmd().iter().any(|a| a == "virtiofsd")
-            && p.kill()
+        let name = p.name().to_string_lossy();
+        let ours = name.contains("vmmbox") && p.cmd().iter().any(|a| a == "virtiofsd");
+        (name == "virtiofsd" || ours) && p.kill()
     })
 }
 
