@@ -48,4 +48,8 @@ pub const MIN_MACOS: u32 = $MIN_MACOS;
 pub const PINS: &[(&str, &str)] = &[
 $pins];
 RS
+# The file must pass `cargo fmt --check`, which formats a one-entry table
+# differently from a longer one, so let rustfmt write it.
+command -v rustfmt >/dev/null 2>&1 || die "rustfmt is needed to format $OUT"
+rustfmt --edition 2024 "$OUT"
 printf 'pin.sh: wrote %s for %s\n' "$OUT" "$TAG" >&2
