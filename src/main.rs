@@ -79,7 +79,10 @@ enum Command {
         /// Distro name of the VM
         name: ImageRef,
     },
-    /// List VMs
+    /// List the VMs you have created, running or not
+    #[command(visible_alias = "list")]
+    Ls,
+    /// List running VMs
     Ps {
         /// Show stopped VMs too
         #[arg(short, long)]
@@ -106,6 +109,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Command::Images => commands::images().map(|()| 0),
         Command::Pull { image } => commands::pull(&image).map(|()| 0),
+        Command::Ls => commands::ps(true).map(|()| 0),
         Command::Ps { all } => commands::ps(all).map(|()| 0),
         Command::Rmi { image } => commands::rmi(&image).map(|()| 0),
         Command::Rm { force, name } => commands::rm(&name, force).map(|()| 0),
@@ -119,5 +123,46 @@ fn main() -> ExitCode {
             eprintln!("vmmbox: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn parse(args: &[&str]) -> Command {
+        let mut argv = vec!["vmmbox"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).unwrap().command
+    }
+
+    #[test]
+    fn the_cli_definition_is_consistent() {
+        // Catches duplicate names and aliases.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn ls_and_list_both_list_created_vms() {
+        assert!(matches!(parse(&["ls"]), Command::Ls));
+        assert!(matches!(parse(&["list"]), Command::Ls));
+    }
+
+    #[test]
+    fn ps_still_lists_only_running_vms_unless_asked() {
+        assert!(matches!(parse(&["ps"]), Command::Ps { all: false }));
+        assert!(matches!(parse(&["ps", "-a"]), Command::Ps { all: true }));
+        assert!(matches!(parse(&["ps", "--all"]), Command::Ps { all: true }));
+    }
+
+    #[test]
+    fn images_and_rmi_take_the_forms_pull_does() {
+        assert!(matches!(parse(&["images"]), Command::Images));
+        assert!(matches!(
+            parse(&["rmi", "ubuntu:24.04"]),
+            Command::Rmi { .. }
+        ));
+        assert!(matches!(parse(&["rmi", "fedora"]), Command::Rmi { .. }));
     }
 }

@@ -160,7 +160,7 @@ pub fn ps(all: bool) -> Result<()> {
         if vms.is_empty() {
             println!("No VMs. Create one with `vmmbox start <distro>`.");
         } else {
-            println!("No running VMs. Use `vmmbox ps -a` to list stopped ones.");
+            println!("No running VMs. Use `vmmbox ls` to list stopped ones.");
         }
         return Ok(());
     }
