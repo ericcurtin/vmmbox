@@ -1,6 +1,7 @@
 //! Implementations of the `vmmbox` subcommands.
 
 use crate::distro::{self, ImageRef};
+use crate::gui::{self, Gui};
 use crate::host::{self, Arch, Platform};
 use crate::http::Http;
 use crate::image::{Images, Pulled};
@@ -167,7 +168,7 @@ pub fn start(r: &ImageRef) -> Result<()> {
 
     // Check every prerequisite up front, before downloading gigabytes.
     platform.check_accel()?;
-    let qemu = Qemu::locate(platform)?;
+    let qemu = Qemu::locate(platform, &paths)?;
     qemu.require_accel(platform.accel())?;
     Ssh::require_client()?;
 
@@ -311,6 +312,10 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<(
     } else {
         println!("  Home:   {}", s.guest_home);
     }
+    match Gui::detect(platform, paths) {
+        Ok(_) => println!("  GUI:    ready (windows open on your desktop)"),
+        Err(e) => println!("  GUI:    unavailable: {e}"),
+    }
     println!("Run `vmmbox exec {name} bash` for a shell.");
     Ok(())
 }
@@ -370,7 +375,18 @@ pub fn stop(r: &ImageRef) -> Result<()> {
     Ok(())
 }
 
-pub fn exec(r: &ImageRef, command: &[String]) -> Result<i32> {
+/// Whether `exec` forwards windows for a command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuiMode {
+    /// Forward windows when the command is a GUI application.
+    Auto,
+    /// Always forward windows (`--gui`).
+    Always,
+    /// Never (`--no-gui`).
+    Never,
+}
+
+pub fn exec(r: &ImageRef, command: &[String], mode: GuiMode) -> Result<i32> {
     let paths = Paths::discover()?;
     let vm = existing_vm(&paths, r)?;
     let name = &vm.state.name;
@@ -378,9 +394,44 @@ pub fn exec(r: &ImageRef, command: &[String]) -> Result<i32> {
         bail!("{name} is not running; start it with `vmmbox start {name}`");
     }
     let ssh = Ssh::for_vm(&vm)?;
-    let remote = remote_command(guest_cwd(&vm).as_deref(), command);
+    let cwd = guest_cwd(&vm);
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    ssh.run_interactive(&remote, tty)
+
+    // GUI apps go through waypipe. Plain commands do not, so terminal use stays
+    // as fast and as simple as ssh: a GUI-ness check (one short ssh call) only
+    // runs for commands that could plausibly be GUI apps.
+    let platform = Platform::current()?;
+    let gui = Gui::detect(platform, &paths);
+    let use_gui = match (&mode, &gui) {
+        (GuiMode::Never, _) => false,
+        (GuiMode::Always, Err(e)) => bail!("{e}"),
+        (GuiMode::Always, Ok(_)) => true,
+        (GuiMode::Auto, Ok(_)) => {
+            gui::worth_checking(command) && ssh.run_quiet(&gui::gui_check_script(&command[0]))? == 0
+        }
+        (GuiMode::Auto, Err(_)) => false,
+    };
+
+    if use_gui && let Ok(gui) = &gui {
+        return gui.run(&paths, &ssh, tty, cwd.as_deref(), command);
+    }
+
+    let remote = remote_command(cwd.as_deref(), command);
+    let code = ssh.run_interactive(&remote, tty)?;
+    // The command failed and this host can't show windows: if it was a GUI app,
+    // say why it did not open.
+    if code != 0
+        && mode == GuiMode::Auto
+        && let Err(reason) = &gui
+        && gui::worth_checking(command)
+        && ssh
+            .run_quiet(&gui::gui_check_script(&command[0]))
+            .unwrap_or(1)
+            == 0
+    {
+        eprintln!("vmmbox: {} is a GUI app, but {reason}", command[0]);
+    }
+    Ok(code)
 }
 
 /// The host working directory as seen from the guest, if it is inside the

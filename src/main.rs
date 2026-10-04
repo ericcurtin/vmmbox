@@ -6,6 +6,7 @@ mod cloudinit;
 mod commands;
 mod cpu;
 mod distro;
+mod gui;
 mod host;
 mod http;
 mod image;
@@ -15,6 +16,7 @@ mod qemu;
 mod qmp;
 mod resources;
 mod ssh;
+mod tools;
 mod util;
 mod vm;
 
@@ -41,8 +43,16 @@ enum Command {
         /// Distro name of the VM
         name: ImageRef,
     },
-    /// Run a command in a running VM as your user, in your current directory
+    /// Run a command in a running VM as your user, in your current directory.
+    /// GUI apps (e.g. google-chrome) open as windows on your desktop.
     Exec {
+        /// Open as a GUI app even if vmmbox doesn't recognise the command as one
+        /// (needed to start GUI apps from a shell: `exec --gui ubuntu bash`)
+        #[arg(long)]
+        gui: bool,
+        /// Never forward windows; run as a plain terminal command
+        #[arg(long, conflicts_with = "gui")]
+        no_gui: bool,
         /// Distro name of the VM
         name: ImageRef,
         /// Command and arguments to run
@@ -68,7 +78,19 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     match cli.command {
         Command::Start { image } => commands::start(&image).map(|()| 0),
         Command::Stop { name } => commands::stop(&name).map(|()| 0),
-        Command::Exec { name, command } => commands::exec(&name, &command),
+        Command::Exec {
+            gui,
+            no_gui,
+            name,
+            command,
+        } => {
+            let mode = match (gui, no_gui) {
+                (true, _) => commands::GuiMode::Always,
+                (_, true) => commands::GuiMode::Never,
+                _ => commands::GuiMode::Auto,
+            };
+            commands::exec(&name, &command, mode)
+        }
         Command::Images => commands::images().map(|()| 0),
         Command::Pull { image } => commands::pull(&image).map(|()| 0),
         Command::Ps { all } => commands::ps(all).map(|()| 0),

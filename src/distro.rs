@@ -127,6 +127,27 @@ impl Family {
         }
     }
 
+    /// Guest packages for GUI apps: waypipe (carries Wayland to the host), a
+    /// font (cloud images have none, so text would not render), and Mesa's
+    /// software OpenGL plus Vulkan drivers (the latter includes the Venus driver
+    /// that talks to the host GPU when the host QEMU provides one).
+    pub fn gui_packages(self) -> &'static [&'static str] {
+        match self {
+            Family::Ubuntu | Family::Debian => &[
+                "waypipe",
+                "fonts-dejavu-core",
+                "libgl1-mesa-dri",
+                "mesa-vulkan-drivers",
+            ],
+            Family::Fedora => &[
+                "waypipe",
+                "dejavu-sans-fonts",
+                "mesa-dri-drivers",
+                "mesa-vulkan-drivers",
+            ],
+        }
+    }
+
     /// Shell command that installs the kernel modules the guest needs for
     /// virtio sound, for the *running* kernel. Cloud images ship a minimal
     /// module set (sound drivers live in `linux-modules-extra` on Ubuntu and

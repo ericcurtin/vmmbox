@@ -3,6 +3,7 @@
 //! ```text
 //! <root>/images/<distro>/<version>/<arch>/{disk.qcow2,meta.json}
 //! <root>/vms/<distro>/{disk.qcow2,seed.img,vm.json,id_ed25519,...}
+//! <root>/tools/{bin,lib,share}/...   (programs vmmbox installs for itself)
 //! ```
 //!
 //! `<root>` is `$VMMBOX_HOME` if set. Otherwise, on macOS and Linux it follows
@@ -60,6 +61,16 @@ impl Paths {
 
     pub fn image_dir(&self, distro: &str, version: &str, arch: &str) -> PathBuf {
         self.images().join(distro).join(version).join(arch)
+    }
+
+    /// A private install prefix for programs vmmbox builds or installs itself
+    /// (a GPU-enabled QEMU, the GUI compositor): `bin/`, `lib/`, `share/`.
+    pub fn tools(&self) -> PathBuf {
+        self.root.join("tools")
+    }
+
+    pub fn tools_bin(&self) -> PathBuf {
+        self.tools().join("bin")
     }
 
     pub fn vms(&self) -> PathBuf {

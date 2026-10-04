@@ -219,6 +219,12 @@ fn build(
     let family = crate::distro::lookup(&image.distro)
         .map(|d| d.family)
         .with_context(|| format!("unknown distro '{}'", image.distro))?;
+    let packages: Vec<&str> = family
+        .audio_packages()
+        .iter()
+        .chain(family.gui_packages())
+        .copied()
+        .collect();
     let instance_id = format!("vmmbox-{name}-{created_at}");
     Seed {
         hostname: name,
@@ -227,7 +233,7 @@ fn build(
         ssh_public_key: &public_key,
         guest_home: &guest_home,
         share_home: home_shared,
-        packages: family.audio_packages(),
+        packages: &packages,
         kernel_modules_cmd: family.kernel_modules_cmd(),
     }
     .write_image(&dir.join("seed.img"))?;

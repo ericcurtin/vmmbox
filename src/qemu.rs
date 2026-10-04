@@ -5,7 +5,9 @@
 
 use crate::cloudinit::HOME_TAG;
 use crate::host::{Accel, Arch, Os, Platform};
+use crate::paths::Paths;
 use crate::qmp::Endpoint;
+use crate::tools::{exe_name, find_binary};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -14,26 +16,6 @@ use std::process::{Child, Command, Stdio};
 /// where a literal comma is written `,,`.
 pub fn escape(s: &str) -> String {
     s.replace(',', ",,")
-}
-
-fn exe_name(name: &str) -> String {
-    if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_string()
-    }
-}
-
-fn find_binary(name: &str, extra_dirs: &[PathBuf]) -> Option<PathBuf> {
-    let file = exe_name(name);
-    let path_dirs = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .unwrap_or_default();
-    path_dirs
-        .iter()
-        .chain(extra_dirs)
-        .map(|d| d.join(&file))
-        .find(|p| p.is_file())
 }
 
 /// Where package managers put QEMU when it isn't on PATH.
@@ -97,10 +79,13 @@ pub struct Firmware {
 }
 
 impl Qemu {
-    pub fn locate(platform: Platform) -> Result<Self> {
+    /// Find QEMU: vmmbox's own tools prefix first (where a GPU-enabled build
+    /// lives), then PATH, then the usual package-manager locations.
+    pub fn locate(platform: Platform, paths: &Paths) -> Result<Self> {
+        let own = [paths.tools_bin()];
         let extra = well_known_dirs(platform.os);
         let sys_name = format!("qemu-system-{}", platform.arch.as_str());
-        let system = find_binary(&sys_name, &extra).with_context(|| {
+        let system = find_binary(&sys_name, &own, &extra).with_context(|| {
             format!(
                 "{sys_name} not found on PATH. Install QEMU: {}",
                 install_hint(platform.os, platform.arch)
@@ -111,7 +96,7 @@ impl Qemu {
             .parent()
             .map(|d| d.join(exe_name("qemu-img")))
             .filter(|p| p.is_file())
-            .or_else(|| find_binary("qemu-img", &extra))
+            .or_else(|| find_binary("qemu-img", &own, &extra))
             .with_context(|| {
                 format!(
                     "qemu-img not found. Install QEMU: {}",
@@ -424,39 +409,16 @@ pub fn build_args(l: &Launch) -> Result<Vec<String>> {
 /// Start QEMU detached from this process: it must outlive `vmmbox start`, and
 /// must not die with the terminal. Output goes to `log`.
 pub fn spawn(qemu: &Qemu, args: &[String], log: &Path) -> Result<Child> {
-    let out = std::fs::File::create(log).with_context(|| format!("creating {}", log.display()))?;
-    let err = out.try_clone()?;
     let mut cmd = Command::new(&qemu.system);
-    cmd.args(args).stdin(Stdio::null()).stdout(out).stderr(err);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid is async-signal-safe and the closure touches no
-        // shared state, as required between fork and exec.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-
-    cmd.spawn()
-        .with_context(|| format!("starting {}", qemu.system.display()))
+    cmd.args(args);
+    crate::proc::spawn_detached(&mut cmd, log)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn launch<'a>(
         platform: Platform,
         endpoint: &'a Endpoint,
@@ -481,6 +443,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn has_pair(args: &[String], flag: &str, value: &str) -> bool {
         args.windows(2).any(|w| w[0] == flag && w[1] == value)
     }

@@ -6,6 +6,7 @@
 
 use crate::vm::Vm;
 use anyhow::{Context, Result, bail};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -86,28 +87,47 @@ impl Ssh {
         })
     }
 
-    fn command(&self) -> Command {
+    /// The ssh options that precede the destination: our private key and known
+    /// hosts, no user config, and the forwarded port.
+    pub fn args(&self) -> Vec<OsString> {
         // ssh splits `-o` values on whitespace, so quote the path. Forward
         // slashes keep Windows paths free of escape sequences.
         let known_hosts = self.known_hosts.to_string_lossy().replace('\\', "/");
+        // `-F`: ignore the user's own ssh config.
+        let mut a: Vec<OsString> = ["-F", NULL_DEVICE, "-i"].map(OsString::from).to_vec();
+        a.push(self.key.clone().into_os_string());
+        a.extend(
+            [
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "PreferredAuthentications=publickey",
+                "-o",
+                "PasswordAuthentication=no",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "LogLevel=ERROR",
+                "-o",
+                "ServerAliveInterval=30",
+            ]
+            .map(OsString::from),
+        );
+        a.push("-o".into());
+        a.push(format!("UserKnownHostsFile=\"{known_hosts}\"").into());
+        a.push("-p".into());
+        a.push(self.port.to_string().into());
+        a
+    }
+
+    /// An `ssh` command with our options applied; the caller adds the rest.
+    pub fn command(&self) -> Command {
         let mut c = Command::new(&self.ssh);
-        c.args(["-F", NULL_DEVICE]) // ignore the user's own ssh config
-            .arg("-i")
-            .arg(&self.key)
-            .args(["-o", "IdentitiesOnly=yes"])
-            .args(["-o", "PreferredAuthentications=publickey"])
-            .args(["-o", "PasswordAuthentication=no"])
-            .args(["-o", "StrictHostKeyChecking=accept-new"])
-            .args(["-o", "LogLevel=ERROR"])
-            .args(["-o", "ServerAliveInterval=30"])
-            .arg("-o")
-            .arg(format!("UserKnownHostsFile=\"{known_hosts}\""))
-            .arg("-p")
-            .arg(self.port.to_string());
+        c.args(self.args());
         c
     }
 
-    fn target(&self) -> String {
+    pub fn target(&self) -> String {
         format!("{}@127.0.0.1", self.user)
     }
 
@@ -155,7 +175,7 @@ impl Ssh {
     }
 }
 
-fn exit_code(status: std::process::ExitStatus) -> i32 {
+pub fn exit_code(status: std::process::ExitStatus) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
