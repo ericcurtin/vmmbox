@@ -6,7 +6,7 @@ use crate::host::{self, Arch, Platform};
 use crate::http::Http;
 use crate::image::{Images, Pulled};
 use crate::paths::Paths;
-use crate::qemu::{self, Launch, Qemu};
+use crate::qemu::{self, Gpu, Launch, Qemu};
 use crate::qmp::Endpoint;
 use crate::resources;
 use crate::ssh::Ssh;
@@ -212,21 +212,26 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<(
         .home_shared
         .then(|| PathBuf::from(&vm.state.host_home));
     let audio = qemu.audio(platform.os);
+    let mut gpu = qemu.gpu(platform.os);
 
-    let args = qemu::build_args(&Launch {
-        name: &name,
-        platform,
-        cpus: compute.cpus,
-        memory_mib: compute.memory_bytes >> 20,
-        disk: &disk,
-        seed: &seed,
-        efi: efi.as_deref().map(|code| (code, efi_vars.as_path())),
-        ssh_port,
-        share: share.as_deref(),
-        console_log: &console_log,
-        qmp: &endpoint,
-        audio: audio.as_ref(),
-    })?;
+    let args_for = |gpu: Option<&Gpu>| {
+        qemu::build_args(&Launch {
+            name: &name,
+            platform,
+            cpus: compute.cpus,
+            memory_mib: compute.memory_bytes >> 20,
+            disk: &disk,
+            seed: &seed,
+            efi: efi.as_deref().map(|code| (code, efi_vars.as_path())),
+            ssh_port,
+            share: share.as_deref(),
+            console_log: &console_log,
+            qmp: &endpoint,
+            audio: audio.as_ref(),
+            gpu,
+        })
+    };
+    let args = args_for(gpu.as_ref().ok())?;
 
     let first_boot = vm.state.started_at.is_none();
     let started = Instant::now();
@@ -249,6 +254,28 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<(
     eprintln!("Waiting for {name} to boot...");
     loop {
         if let Some(status) = child.try_wait()? {
+            // A GPU this host cannot actually drive must not stop the VM from
+            // booting: say why, and start again without it.
+            if let Ok(g) =
+                std::mem::replace(&mut gpu, Err("none (QEMU would not start with it)".into()))
+            {
+                let why = tail_lines(&vm.qemu_log(), 1);
+                let why = why.trim();
+                eprintln!(
+                    "warning: QEMU could not start with the GPU ({}){}; starting without it",
+                    g.describe(),
+                    if why.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {why}")
+                    }
+                );
+                endpoint.cleanup();
+                child = qemu::spawn(qemu, &args_for(None)?, &vm.qemu_log())?;
+                vm.state.pid = Some(child.id());
+                vm.save()?;
+                continue;
+            }
             vm.state.pid = None;
             vm.state.started_at = None;
             vm.save()?;
@@ -304,6 +331,10 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<(
     println!("  CPUs:   {}", s.cpus);
     println!("  Memory: {}", format_bytes(s.memory_bytes));
     println!("  Disk:   {} (grows on demand)", format_bytes(s.disk_bytes));
+    match &gpu {
+        Ok(g) => println!("  GPU:    {}", g.describe()),
+        Err(why) => println!("  GPU:    {why}"),
+    }
     println!("  User:   {} (uid {}, gid {})", s.user, s.uid, s.gid);
     if s.home_shared && s.guest_home == s.host_home {
         println!("  Home:   {} (shared with the host)", s.guest_home);

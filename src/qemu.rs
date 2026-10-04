@@ -73,6 +73,139 @@ pub struct Audio {
     pub virtio: bool,
 }
 
+/// A paravirtual GPU backed by the host's real one (virtio-gpu with
+/// virglrenderer). Linux hosts only: elsewhere upstream QEMU cannot give a
+/// Linux guest an accelerated GPU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gpu {
+    /// The DRM render node QEMU draws on, e.g. `/dev/dri/renderD128`.
+    pub render_node: PathBuf,
+    /// Vulkan (Venus) as well as OpenGL (virgl).
+    pub vulkan: bool,
+}
+
+impl Gpu {
+    pub fn describe(&self) -> String {
+        format!(
+            "{} via {}",
+            if self.vulkan {
+                "Vulkan and OpenGL"
+            } else {
+                "OpenGL"
+            },
+            self.render_node.display()
+        )
+    }
+}
+
+/// What the host and its QEMU can do for a GPU; see [`plan_gpu`].
+#[derive(Debug, Default)]
+struct GpuHost {
+    /// `virtio-gpu-gl-pci` exists (QEMU was built with virglrenderer).
+    gl_device: bool,
+    /// The `egl-headless` display exists.
+    egl_headless: bool,
+    /// The GL device has the `venus` option (virglrenderer 1.0 or newer).
+    venus_option: bool,
+    /// Host kernel (major, minor).
+    kernel: Option<(u32, u32)>,
+    /// Render nodes this user can open for reading and writing.
+    render_nodes: Vec<PathBuf>,
+}
+
+/// The oldest kernel on which virglrenderer can pass Vulkan through (host
+/// blob memory), per the QEMU documentation.
+const VENUS_MIN_KERNEL: (u32, u32) = (6, 13);
+
+/// How to treat the GPU, from `VMMBOX_GPU`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuMode {
+    Auto,
+    /// `none`: no GPU device.
+    Off,
+    /// `opengl`: no Vulkan, e.g. if Venus misbehaves on this host.
+    OpenGl,
+}
+
+fn gpu_mode(value: Option<&str>) -> GpuMode {
+    match value {
+        Some("none") => GpuMode::Off,
+        Some("opengl") => GpuMode::OpenGl,
+        _ => GpuMode::Auto,
+    }
+}
+
+/// `6.13.0-generic` -> (6, 13).
+fn parse_kernel(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor: String = parts
+        .next()?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    Some((major, minor.parse().ok()?))
+}
+
+/// Decide whether the guest gets a GPU. `Err` carries the reason it does not,
+/// which `vmmbox start` shows.
+///
+/// A GPU QEMU cannot use is worse than none: without a usable render node QEMU
+/// refuses to start at all. So every requirement is checked up front.
+fn plan_gpu(os: Os, mode: GpuMode, host: &GpuHost) -> std::result::Result<Gpu, String> {
+    if os != Os::Linux {
+        return Err(format!(
+            "none (QEMU cannot give a Linux guest an accelerated GPU on {})",
+            os.name()
+        ));
+    }
+    if mode == GpuMode::Off {
+        return Err("none (disabled by VMMBOX_GPU)".into());
+    }
+    if !host.gl_device {
+        return Err("none (this QEMU was built without virglrenderer)".into());
+    }
+    if !host.egl_headless {
+        return Err("none (this QEMU has no egl-headless display)".into());
+    }
+    let Some(node) = host.render_nodes.first() else {
+        return Err(
+            "none (no usable /dev/dri/renderD*; is your user in the 'render' group?)".into(),
+        );
+    };
+    let vulkan = mode == GpuMode::Auto
+        && host.venus_option
+        && host.kernel.is_some_and(|k| k >= VENUS_MIN_KERNEL);
+    Ok(Gpu {
+        render_node: node.clone(),
+        vulkan,
+    })
+}
+
+fn usable_render_nodes() -> Vec<PathBuf> {
+    let Ok(dir) = std::fs::read_dir("/dev/dri") else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<PathBuf> = dir
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("renderD"))
+        })
+        .filter(|p| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(p)
+                .is_ok()
+        })
+        .collect();
+    nodes.sort();
+    nodes
+}
+
 pub struct Firmware {
     pub code: PathBuf,
     pub vars_template: PathBuf,
@@ -147,6 +280,33 @@ impl Qemu {
     /// Whether this build can share a host directory with the guest (9p).
     pub fn supports_9p(&self) -> bool {
         self.has_device("virtio-9p-pci")
+    }
+
+    /// How to give the guest a host-accelerated GPU, or why it gets none.
+    /// `VMMBOX_GPU=none` turns it off; `VMMBOX_GPU=opengl` leaves out Vulkan.
+    pub fn gpu(&self, os: Os) -> std::result::Result<Gpu, String> {
+        let mode = gpu_mode(std::env::var("VMMBOX_GPU").ok().as_deref());
+        // Don't ask QEMU anything on hosts that can never have one.
+        if os != Os::Linux || mode == GpuMode::Off {
+            return plan_gpu(os, mode, &GpuHost::default());
+        }
+        let gl_device = self.has_device("virtio-gpu-gl-pci");
+        let host = GpuHost {
+            gl_device,
+            egl_headless: self
+                .run_help(&["-display", "help"])
+                .lines()
+                .any(|l| l.trim() == "egl-headless"),
+            venus_option: gl_device
+                && self
+                    .run_help(&["-device", "virtio-gpu-gl-pci,help"])
+                    .contains("venus="),
+            kernel: std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .ok()
+                .and_then(|r| parse_kernel(&r)),
+            render_nodes: usable_render_nodes(),
+        };
+        plan_gpu(os, mode, &host)
     }
 
     /// Pick how to give the guest sound: the host OS's native audio backend
@@ -284,6 +444,7 @@ pub struct Launch<'a> {
     pub console_log: &'a Path,
     pub qmp: &'a Endpoint,
     pub audio: Option<&'a Audio>,
+    pub gpu: Option<&'a Gpu>,
 }
 
 #[derive(Default)]
@@ -328,7 +489,14 @@ pub fn build_args(l: &Launch) -> Result<Vec<String>> {
 
     // No default devices: everything the guest sees is listed here.
     a.flag("-nodefaults");
-    a.kv("-display", "none".into());
+    match l.gpu {
+        // Headless, but with an EGL context on the host GPU for virglrenderer.
+        Some(gpu) => a.kv(
+            "-display",
+            format!("egl-headless,rendernode={}", path(&gpu.render_node)),
+        ),
+        None => a.kv("-display", "none".into()),
+    }
 
     if let Some((code, vars)) = l.efi {
         a.kv(
@@ -394,6 +562,16 @@ pub fn build_args(l: &Launch) -> Result<Vec<String>> {
         }
     }
 
+    if let Some(gpu) = l.gpu {
+        let mut device = String::from("virtio-gpu-gl-pci");
+        if gpu.vulkan {
+            // Host-visible memory and blob resources are what Venus needs; the
+            // window is address space, not memory taken from the host.
+            device.push_str(",hostmem=4G,blob=true,venus=true");
+        }
+        a.kv("-device", device);
+    }
+
     a.kv(
         "-chardev",
         format!("file,id=console,path={}", path(l.console_log)),
@@ -440,6 +618,7 @@ mod tests {
             console_log: Path::new("/data/vms/ubuntu/console.log"),
             qmp: endpoint,
             audio: None,
+            gpu: None,
         }
     }
 
@@ -542,6 +721,67 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn no_gpu_means_no_gpu_device() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        };
+        let args = build_args(&launch(platform, &ep, None)).unwrap();
+        assert!(has_pair(&args, "-display", "none"));
+        assert!(!args.iter().any(|a| a.contains("virtio-gpu")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vulkan_gpu_args() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        };
+        let gpu = Gpu {
+            render_node: "/dev/dri/renderD128".into(),
+            vulkan: true,
+        };
+        let mut l = launch(platform, &ep, None);
+        l.gpu = Some(&gpu);
+        let args = build_args(&l).unwrap();
+        assert!(has_pair(
+            &args,
+            "-display",
+            "egl-headless,rendernode=/dev/dri/renderD128"
+        ));
+        assert!(has_pair(
+            &args,
+            "-device",
+            "virtio-gpu-gl-pci,hostmem=4G,blob=true,venus=true"
+        ));
+        // One display, not two.
+        assert_eq!(args.iter().filter(|a| *a == "-display").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opengl_gpu_args_leave_out_venus() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        };
+        let gpu = Gpu {
+            render_node: "/dev/dri/renderD129".into(),
+            vulkan: false,
+        };
+        let mut l = launch(platform, &ep, None);
+        l.gpu = Some(&gpu);
+        let args = build_args(&l).unwrap();
+        assert!(has_pair(&args, "-device", "virtio-gpu-gl-pci"));
+        assert!(!args.iter().any(|a| a.contains("venus")));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn whpx_args() {
         let ep = Endpoint::Unix("/tmp/s.sock".into());
         let platform = Platform {
@@ -579,5 +819,135 @@ mod tests {
             args.iter()
                 .any(|a| a.starts_with("file=/data/a,,b/disk.qcow2,"))
         );
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+
+    fn capable() -> GpuHost {
+        GpuHost {
+            gl_device: true,
+            egl_headless: true,
+            venus_option: true,
+            kernel: Some((6, 14)),
+            render_nodes: vec!["/dev/dri/renderD128".into(), "/dev/dri/renderD129".into()],
+        }
+    }
+
+    #[test]
+    fn a_capable_linux_host_gets_vulkan_on_its_first_render_node() {
+        let gpu = plan_gpu(Os::Linux, GpuMode::Auto, &capable()).unwrap();
+        assert_eq!(gpu.render_node, Path::new("/dev/dri/renderD128"));
+        assert!(gpu.vulkan);
+        assert_eq!(gpu.describe(), "Vulkan and OpenGL via /dev/dri/renderD128");
+    }
+
+    #[test]
+    fn macos_and_windows_never_get_one() {
+        for os in [Os::Mac, Os::Windows] {
+            let why = plan_gpu(os, GpuMode::Auto, &capable()).unwrap_err();
+            assert!(why.contains(os.name()), "{why}");
+        }
+    }
+
+    #[test]
+    fn an_old_kernel_or_old_virglrenderer_falls_back_to_opengl() {
+        let old_kernel = GpuHost {
+            kernel: Some((6, 12)),
+            ..capable()
+        };
+        assert!(
+            !plan_gpu(Os::Linux, GpuMode::Auto, &old_kernel)
+                .unwrap()
+                .vulkan
+        );
+        let unknown_kernel = GpuHost {
+            kernel: None,
+            ..capable()
+        };
+        assert!(
+            !plan_gpu(Os::Linux, GpuMode::Auto, &unknown_kernel)
+                .unwrap()
+                .vulkan
+        );
+        let no_venus = GpuHost {
+            venus_option: false,
+            ..capable()
+        };
+        let gpu = plan_gpu(Os::Linux, GpuMode::Auto, &no_venus).unwrap();
+        assert!(!gpu.vulkan);
+        assert_eq!(gpu.describe(), "OpenGL via /dev/dri/renderD128");
+        // Exactly 6.13 is new enough; a newer major is too.
+        for k in [(6, 13), (7, 0)] {
+            let h = GpuHost {
+                kernel: Some(k),
+                ..capable()
+            };
+            assert!(
+                plan_gpu(Os::Linux, GpuMode::Auto, &h).unwrap().vulkan,
+                "{k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_pieces_are_reported_not_half_enabled() {
+        // QEMU refuses to start with a GL GPU and no render node, so none of
+        // these may produce a device.
+        for (host, needle) in [
+            (
+                GpuHost {
+                    gl_device: false,
+                    ..capable()
+                },
+                "virglrenderer",
+            ),
+            (
+                GpuHost {
+                    egl_headless: false,
+                    ..capable()
+                },
+                "egl-headless",
+            ),
+            (
+                GpuHost {
+                    render_nodes: vec![],
+                    ..capable()
+                },
+                "render",
+            ),
+        ] {
+            let why = plan_gpu(Os::Linux, GpuMode::Auto, &host).unwrap_err();
+            assert!(why.starts_with("none"), "{why}");
+            assert!(why.contains(needle), "{why}");
+        }
+    }
+
+    #[test]
+    fn the_environment_can_turn_it_off_or_drop_vulkan() {
+        assert_eq!(gpu_mode(None), GpuMode::Auto);
+        assert_eq!(gpu_mode(Some("")), GpuMode::Auto);
+        assert_eq!(gpu_mode(Some("none")), GpuMode::Off);
+        assert_eq!(gpu_mode(Some("opengl")), GpuMode::OpenGl);
+
+        let why = plan_gpu(Os::Linux, GpuMode::Off, &capable()).unwrap_err();
+        assert!(why.contains("VMMBOX_GPU"), "{why}");
+        let gpu = plan_gpu(Os::Linux, GpuMode::OpenGl, &capable()).unwrap();
+        assert!(!gpu.vulkan);
+    }
+
+    #[test]
+    fn kernel_release_strings() {
+        assert_eq!(parse_kernel("6.13.0-generic\n"), Some((6, 13)));
+        assert_eq!(parse_kernel("6.8.0-45-generic"), Some((6, 8)));
+        assert_eq!(parse_kernel("6.14-rc2"), Some((6, 14)));
+        assert_eq!(
+            parse_kernel("5.15.167.4-microsoft-standard-WSL2"),
+            Some((5, 15))
+        );
+        assert_eq!(parse_kernel(""), None);
+        assert_eq!(parse_kernel("garbage"), None);
     }
 }
