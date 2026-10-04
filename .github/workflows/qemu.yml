@@ -68,7 +68,9 @@ jobs:
         run: |
           . packaging/qemu/VERSION
           ls -l dist
+          # Not "latest": that label belongs to vmmbox's own releases.
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
+            --latest=false \
             --title "QEMU $QEMU_VERSION for vmmbox (r$BUNDLE_REV)" \
             --notes "Unmodified upstream QEMU $QEMU_VERSION (https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz), built with packaging/qemu/build.sh for macOS $MIN_MACOS or newer. vmmbox downloads these and checks them against SHA-256 values pinned in its source; run packaging/qemu/pin.sh to pin them."

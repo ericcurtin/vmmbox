@@ -9,9 +9,11 @@ class Vmmbox < Formula
   homepage "https://github.com/@REPO@"
   license "Apache-2.0"
 
-  # The hypervisor front end. vmmbox itself also needs ssh and curl: macOS ships
-  # both, and Linux machines have them.
-  depends_on "qemu"
+  # vmmbox needs ssh and curl: macOS ships both, and Linux machines have them.
+  # On macOS it needs nothing else from Homebrew: it downloads its own QEMU,
+  # built with the virtio-fs support Homebrew's lacks, the first time it is used
+  # (`vmmbox setup` does it sooner). A formula cannot do that itself: Homebrew's
+  # sandbox does not let post_install write to the user's home.
   uses_from_macos "curl"
 
   on_macos do
@@ -27,6 +29,10 @@ class Vmmbox < Formula
     # Only x86_64 is supported on Linux; this gives other architectures a clear
     # Homebrew error instead of a missing download.
     depends_on arch: :x86_64
+
+    # On Linux QEMU and the virtio-fs server come from Homebrew or the system.
+    depends_on "qemu"
+    depends_on "virtiofsd"
 
     on_intel do
       url "@BASE_URL@/vmmbox-x86_64-unknown-linux-musl"
@@ -47,6 +53,9 @@ class Vmmbox < Formula
         third-party tap, so Homebrew needs you to ask for them explicitly:
 
           brew install J-x-Z/tap/cocoa-way J-x-Z/tap/waypipe-darwin
+
+        The first time you start a VM, vmmbox downloads its own QEMU (about 11 MB)
+        into ~/.local/share/vmmbox; `vmmbox setup` does that now.
       EOS
     else
       <<~EOS
@@ -59,9 +68,8 @@ class Vmmbox < Formula
       EOS
     end
     <<~EOS
-      Start a VM and get a shell in it:
+      Get a shell in a VM (it is pulled, created and started if need be):
 
-        vmmbox start ubuntu
         vmmbox run ubuntu bash
 
       #{gui}
