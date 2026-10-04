@@ -115,6 +115,9 @@ impl Paths {
 mod tests {
     use super::*;
 
+    // The XDG logic is only used on unix hosts (Windows uses %LOCALAPPDATA%),
+    // and its tests use unix-style absolute paths.
+    #[cfg(unix)]
     #[test]
     fn defaults_to_dot_local_share() {
         let home = Some(PathBuf::from("/Users/me"));
@@ -133,6 +136,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn honours_absolute_xdg_data_home() {
         assert_eq!(

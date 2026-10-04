@@ -46,7 +46,7 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-[ -n "$VERSION" ] && [ -n "$CHECKSUMS" ] && [ -n "$OUT_DIR" ] || usage
+if [ -z "$VERSION" ] || [ -z "$CHECKSUMS" ] || [ -z "$OUT_DIR" ]; then usage; fi
 [ -f "$CHECKSUMS" ] || die "no such checksums file: $CHECKSUMS"
 
 # Strictly MAJOR.MINOR.PATCH: it lands in Ruby, JSON and a URL, and is what

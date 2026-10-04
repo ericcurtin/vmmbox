@@ -94,10 +94,10 @@ fn detect_performance_cores() -> Option<usize> {
         if !is_cpu {
             continue;
         }
-        if let Ok(s) = std::fs::read_to_string(entry.path().join("cpu_capacity")) {
-            if let Ok(c) = s.trim().parse::<u32>() {
-                caps.push(c);
-            }
+        if let Ok(s) = std::fs::read_to_string(entry.path().join("cpu_capacity"))
+            && let Ok(c) = s.trim().parse::<u32>()
+        {
+            caps.push(c);
         }
     }
     let (&max, &min) = (caps.iter().max()?, caps.iter().min()?);
