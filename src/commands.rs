@@ -141,12 +141,11 @@ fn check_version(vm: &Vm, r: &ImageRef) -> Result<()> {
         && *v != vm.state.version
     {
         bail!(
-            "the '{}' VM is {}, not {}:{v}. Only one VM per distro is supported; to use a \
-             different version, stop it and delete {} first",
-            vm.state.name,
+            "the '{name}' VM is {}, not {}:{v}. Only one VM per distro is supported; to use a \
+             different version, remove it first with `vmmbox rm {name}`",
             vm.reference(),
             r.distro.name,
-            vm.dir.display()
+            name = vm.state.name
         );
     }
     Ok(())
@@ -335,22 +334,20 @@ fn wait_exit(pid: u32, timeout: Duration) -> bool {
     !crate::proc::is_qemu(pid)
 }
 
-pub fn stop(r: &ImageRef) -> Result<()> {
-    let paths = Paths::discover()?;
-    let mut vm = existing_vm(&paths, r)?;
+/// Shut a VM down, gracefully if the guest cooperates. Returns whether it was
+/// running.
+fn stop_vm(paths: &Paths, vm: &mut Vm) -> Result<bool> {
     let name = vm.state.name.clone();
-
     let Some(pid) = vm.running_pid() else {
         if vm.state.pid.is_some() {
             vm.state.pid = None;
             vm.state.started_at = None;
             vm.save()?;
         }
-        println!("{name} is not running");
-        return Ok(());
+        return Ok(false);
     };
 
-    let endpoint = Endpoint::for_vm(&paths, &name)?;
+    let endpoint = Endpoint::for_vm(paths, &name)?;
     eprintln!("Stopping {name}...");
     // Ask politely first (ACPI power button) so the guest unmounts and syncs.
     let graceful = match endpoint.execute("system_powerdown", Duration::from_secs(10)) {
@@ -375,8 +372,85 @@ pub fn stop(r: &ImageRef) -> Result<()> {
     vm.state.pid = None;
     vm.state.started_at = None;
     vm.save()?;
-    println!("{name} stopped");
+    Ok(true)
+}
+
+pub fn stop(r: &ImageRef) -> Result<()> {
+    let paths = Paths::discover()?;
+    let mut vm = existing_vm(&paths, r)?;
+    let name = vm.state.name.clone();
+    if stop_vm(&paths, &mut vm)? {
+        println!("{name} stopped");
+    } else {
+        println!("{name} is not running");
+    }
     Ok(())
+}
+
+pub fn rm(r: &ImageRef, force: bool) -> Result<()> {
+    let paths = Paths::discover()?;
+    let freed = remove_vm(&paths, r, force)?;
+    println!("{} removed ({} freed)", r.distro.name, format_bytes(freed));
+    Ok(())
+}
+
+/// Delete a VM and its disk, returning the bytes freed. The pulled image it was
+/// made from is kept, and so is everything in the shared host home: that is
+/// mounted from the host, not stored in the VM directory.
+fn remove_vm(paths: &Paths, r: &ImageRef, force: bool) -> Result<u64> {
+    let name = r.distro.name;
+    let dir = paths.vm_dir(name);
+    let mut vm = match vm::load(paths, name) {
+        Ok(Some(vm)) => {
+            check_version(&vm, r)?;
+            vm
+        }
+        Ok(None) => bail!("no VM named '{name}'"),
+        // A VM whose record is unreadable cannot be inspected, but it can still
+        // be removed on request.
+        Err(e) if force && dir.is_dir() => {
+            eprintln!("warning: {e:#}; removing it anyway");
+            return delete_vm_dir(paths, &dir);
+        }
+        Err(e) => return Err(e.context(format!("use `vmmbox rm -f {name}` to remove it anyway"))),
+    };
+    if vm.is_running() {
+        if !force {
+            bail!(
+                "{name} is running; stop it first with `vmmbox stop {name}`, or use `vmmbox rm -f {name}`"
+            );
+        }
+        stop_vm(paths, &mut vm)?;
+    }
+    delete_vm_dir(paths, &vm.dir)
+}
+
+/// Remove one VM directory, refusing anything that is not a real directory
+/// directly inside the VM store (a symlink there must not lead the delete
+/// somewhere else).
+fn delete_vm_dir(paths: &Paths, dir: &std::path::Path) -> Result<u64> {
+    let meta =
+        std::fs::symlink_metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
+    if !meta.is_dir() || dir.parent() != Some(paths.vms().as_path()) {
+        bail!("refusing to remove {}: not a VM directory", dir.display());
+    }
+    let size = dir_size(dir);
+    std::fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))?;
+    Ok(size)
+}
+
+/// Total size of the regular files under `dir`, not following symlinks.
+fn dir_size(dir: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
 }
 
 /// Whether `exec` forwards windows for a command.
@@ -480,6 +554,190 @@ mod tests {
             remote_command(Some("/Users/me/my proj"), &cmd),
             "cd '/Users/me/my proj' 2>/dev/null; exec sh -c 'echo $HOME; ls '\\''x y'\\'''"
         );
+    }
+
+    use crate::vm::VmState;
+
+    fn scratch(tag: &str) -> (Paths, PathBuf) {
+        let root = std::env::temp_dir().join(format!("vmmbox-rm-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("vms")).unwrap();
+        (Paths::with_root(root.clone()), root)
+    }
+
+    /// A stopped VM on disk: a record plus a disk file of `disk` bytes.
+    fn fake_vm(paths: &Paths, name: &str, version: &str, disk: usize, pid: Option<u32>) -> PathBuf {
+        let dir = paths.vm_dir(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = VmState {
+            name: name.into(),
+            distro: name.into(),
+            version: version.into(),
+            arch: "aarch64".into(),
+            created_at: 1,
+            disk_bytes: 1 << 30,
+            user: "me".into(),
+            uid: 501,
+            gid: 20,
+            guest_home: "/home/me".into(),
+            host_home: "/Users/me".into(),
+            home_shared: true,
+            pid,
+            ssh_port: 2222,
+            started_at: None,
+            cpus: 4,
+            memory_bytes: 1 << 30,
+        };
+        std::fs::write(dir.join("vm.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        std::fs::write(dir.join("disk.qcow2"), vec![0u8; disk]).unwrap();
+        dir
+    }
+
+    fn rref(s: &str) -> ImageRef {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn rm_deletes_the_vm_and_reports_the_space() {
+        let (paths, root) = scratch("ok");
+        let dir = fake_vm(&paths, "ubuntu", "26.04", 5000, None);
+        // A pulled image and a neighbouring VM must survive.
+        let image = paths.image_dir("ubuntu", "26.04", "aarch64");
+        std::fs::create_dir_all(&image).unwrap();
+        std::fs::write(image.join("disk.qcow2"), b"image").unwrap();
+        let other = fake_vm(&paths, "debian", "13", 10, None);
+
+        let freed = remove_vm(&paths, &rref("ubuntu"), false).unwrap();
+        assert!(freed >= 5000, "freed {freed}");
+        assert!(!dir.exists());
+        assert!(image.join("disk.qcow2").exists(), "the image is kept");
+        assert!(other.join("vm.json").exists(), "other VMs are untouched");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rm_unknown_vm_and_wrong_version() {
+        let (paths, root) = scratch("unknown");
+        let err = remove_vm(&paths, &rref("ubuntu"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no VM named 'ubuntu'"), "{err}");
+
+        let dir = fake_vm(&paths, "ubuntu", "24.04", 10, None);
+        let err = remove_vm(&paths, &rref("ubuntu:26.04"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ubuntu:24.04") && err.contains("vmmbox rm ubuntu"),
+            "{err}"
+        );
+        assert!(dir.exists(), "a version mismatch must not delete anything");
+        // Naming the right version works.
+        remove_vm(&paths, &rref("ubuntu:24.04"), false).unwrap();
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rm_unreadable_record_needs_force() {
+        let (paths, root) = scratch("corrupt");
+        let dir = paths.vm_dir("fedora");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vm.json"), b"{ not json").unwrap();
+        std::fs::write(dir.join("disk.qcow2"), vec![0u8; 100]).unwrap();
+
+        let err = format!(
+            "{:#}",
+            remove_vm(&paths, &rref("fedora"), false).unwrap_err()
+        );
+        assert!(err.contains("rm -f fedora"), "{err}");
+        assert!(dir.exists());
+
+        assert!(remove_vm(&paths, &rref("fedora"), true).unwrap() >= 100);
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Run only by `fake_qemu`: a process that just sits there.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper process for the rm tests, not a test"]
+    fn fake_qemu_sleeper() {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// A long-running process whose name contains "qemu", so vmmbox takes it
+    /// for the VM. It is a copy of this test executable (a system binary such as
+    /// `sleep` cannot be copied and run on macOS), sent to sleep.
+    #[cfg(unix)]
+    fn fake_qemu(root: &std::path::Path) -> std::process::Child {
+        use std::process::Stdio;
+        let bin = root.join("qemu-fake");
+        std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap();
+        let mut child = std::process::Command::new(&bin)
+            .args(["--ignored", "--exact", "commands::tests::fake_qemu_sleeper"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Wait until vmmbox itself recognises it.
+        for _ in 0..100 {
+            if crate::proc::is_qemu(child.id()) {
+                return child;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the fake qemu never showed up as a qemu process");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm_refuses_a_running_vm_without_force() {
+        let (paths, root) = scratch("running");
+        let mut child = fake_qemu(&root);
+        let dir = fake_vm(&paths, "ubuntu", "26.04", 10, Some(child.id()));
+
+        let err = remove_vm(&paths, &rref("ubuntu"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is running") && err.contains("rm -f ubuntu"),
+            "{err}"
+        );
+        assert!(
+            dir.join("disk.qcow2").exists(),
+            "a running VM must not be touched"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm_never_follows_a_symlink_out_of_the_store() {
+        let (paths, root) = scratch("symlink");
+        // vms/ubuntu is a symlink to a directory elsewhere that has a valid
+        // record, so loading succeeds; deleting must still be refused.
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let real = fake_vm(&paths, "debian", "13", 10, None);
+        std::fs::copy(real.join("vm.json"), elsewhere.join("vm.json")).unwrap();
+        std::fs::write(elsewhere.join("precious.txt"), b"keep me").unwrap();
+        std::fs::remove_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, paths.vm_dir("debian")).unwrap();
+
+        let err = remove_vm(&paths, &rref("debian"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a VM directory"), "{err}");
+        assert!(
+            elsewhere.join("precious.txt").exists(),
+            "target of the symlink survived"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

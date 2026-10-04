@@ -51,6 +51,12 @@ impl Paths {
         Ok(Self { root })
     }
 
+    /// A store rooted at `root`, for tests.
+    #[cfg(test)]
+    pub fn with_root(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

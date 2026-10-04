@@ -66,6 +66,14 @@ enum Command {
         /// Distro, optionally with a version: distro[:version]
         image: ImageRef,
     },
+    /// Remove a VM and its disk (the pulled image is kept)
+    Rm {
+        /// Stop the VM first if it is running
+        #[arg(short, long)]
+        force: bool,
+        /// Distro name of the VM
+        name: ImageRef,
+    },
     /// List VMs
     Ps {
         /// Show stopped VMs too
@@ -94,6 +102,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Images => commands::images().map(|()| 0),
         Command::Pull { image } => commands::pull(&image).map(|()| 0),
         Command::Ps { all } => commands::ps(all).map(|()| 0),
+        Command::Rm { force, name } => commands::rm(&name, force).map(|()| 0),
     }
 }
 
