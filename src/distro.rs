@@ -128,9 +128,11 @@ impl Family {
     }
 
     /// Guest packages for GUI apps: waypipe (carries Wayland to the host), a
-    /// font (cloud images have none, so text would not render), and Mesa's
+    /// font (cloud images have none, so text would not render), Mesa's
     /// software OpenGL plus Vulkan drivers (the latter includes the Venus driver
-    /// that talks to the host GPU when the host QEMU provides one).
+    /// that talks to the host GPU when the host QEMU provides one), and
+    /// Xwayland, an X server for the apps that cannot speak Wayland (VLC 3's
+    /// interface, for one). It only runs while such an app does; see gui.rs.
     pub fn gui_packages(self) -> &'static [&'static str] {
         match self {
             Family::Ubuntu | Family::Debian => &[
@@ -138,12 +140,14 @@ impl Family {
                 "fonts-dejavu-core",
                 "libgl1-mesa-dri",
                 "mesa-vulkan-drivers",
+                "xwayland",
             ],
             Family::Fedora => &[
                 "waypipe",
                 "dejavu-sans-fonts",
                 "mesa-dri-drivers",
                 "mesa-vulkan-drivers",
+                "xorg-x11-server-Xwayland",
             ],
         }
     }

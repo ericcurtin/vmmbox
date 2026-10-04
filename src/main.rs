@@ -56,6 +56,10 @@ enum Command {
         /// Never forward windows; run as a plain terminal command
         #[arg(long, conflicts_with = "gui")]
         no_gui: bool,
+        /// Also give the app an X server, for software with no Wayland support.
+        /// Automatic for VLC and the classic X utilities. Implies --gui
+        #[arg(long, conflicts_with = "no_gui")]
+        x11: bool,
         /// Distro name of the VM
         name: ImageRef,
         /// Command and arguments to run
@@ -100,15 +104,16 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Run {
             gui,
             no_gui,
+            x11,
             name,
             command,
         } => {
-            let mode = match (gui, no_gui) {
+            let mode = match (gui || x11, no_gui) {
                 (true, _) => commands::GuiMode::Always,
                 (_, true) => commands::GuiMode::Never,
                 _ => commands::GuiMode::Auto,
             };
-            commands::run(&name, &command, mode)
+            commands::run(&name, &command, mode, x11)
         }
         Command::Images => commands::images().map(|()| 0),
         Command::Pull { image } => commands::pull(&image).map(|()| 0),
@@ -157,19 +162,30 @@ mod tests {
         let Command::Run {
             gui,
             no_gui,
+            x11,
             name,
             command,
         } = parse(&["run", "ubuntu:24.04", "ls", "-la"])
         else {
             panic!("not run");
         };
-        assert!(!gui && !no_gui);
+        assert!(!gui && !no_gui && !x11);
         assert_eq!(name.distro.name, "ubuntu");
         assert_eq!(command, ["ls", "-la"]);
         assert!(matches!(
             parse(&["run", "--gui", "ubuntu", "bash"]),
             Command::Run { gui: true, .. }
         ));
+    }
+
+    #[test]
+    fn x11_is_a_flag_that_cannot_be_combined_with_no_gui() {
+        assert!(matches!(
+            parse(&["run", "--x11", "fedora", "xeyes"]),
+            Command::Run { x11: true, .. }
+        ));
+        let argv = ["vmmbox", "run", "--x11", "--no-gui", "fedora", "xeyes"];
+        assert!(Cli::try_parse_from(argv).is_err());
     }
 
     #[test]

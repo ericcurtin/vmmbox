@@ -137,6 +137,7 @@ impl Gui {
         tty: bool,
         cwd: Option<&str>,
         command: &[String],
+        x11: bool,
     ) -> Result<i32> {
         let wayland = self.socket(paths)?;
         let id = format!("{}-{}", std::process::id(), crate::util::now_secs());
@@ -179,7 +180,8 @@ impl Gui {
         }
 
         let rc_file = format!("/tmp/vmmbox-rc-{id}");
-        let remote = gui_server_command(&guest_sock, &gui_script(cwd, command, &rc_file), &rc_file);
+        let script = gui_script(cwd, command, &rc_file, x11);
+        let remote = gui_server_command(&guest_sock, &script, &rc_file);
         let mut cmd = ssh.command();
         cmd.args(["-o", "StreamLocalBindUnlink=yes"])
             .arg("-R")
@@ -205,6 +207,7 @@ impl Gui {
         _tty: bool,
         _cwd: Option<&str>,
         _command: &[String],
+        _x11: bool,
     ) -> Result<i32> {
         bail!("GUI apps are not supported on this host yet")
     }
@@ -318,6 +321,19 @@ const WRAPPERS: &[&str] = &[
     "exec", "env", "sudo", "nohup", "setsid", "time", "command", "nice", "stdbuf", "if", "then",
     "else", "elif", "do", "while", "until", "!",
 ];
+
+/// Programs with no Wayland support, which run on an X server or not at all:
+/// VLC 3's interface, and the classic X utilities.
+const X11_ONLY: &[&str] = &[
+    "vlc", "qvlc", "svlc", "xterm", "uxterm", "xeyes", "xclock", "xcalc", "xev", "xlogo",
+    "xmessage", "xedit", "xfontsel", "xload", "xmag", "xman",
+];
+
+/// Whether any of these programs needs an X server. They are GUI apps by
+/// definition, launcher or not.
+pub fn needs_x11(candidates: &[String]) -> bool {
+    candidates.iter().any(|c| X11_ONLY.contains(&basename(c)))
+}
 
 fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
@@ -434,16 +450,35 @@ exit 1
     format!("sh -c {}", sh_quote(&script))
 }
 
+/// Where the guest keeps X11 sockets.
+const X11_DIR: &str = "/tmp/.X11-unix";
+
 /// The script the guest shell runs for a GUI command: enter the working
 /// directory (best effort), set the Wayland-preferring environment, run the
 /// command, and record its exit status in `rc_file`.
 ///
+/// With `x11`, the app gets an X server too, for software with no Wayland
+/// support: see [`x11_setup`]. It is opt-in because a Wayland app that merely
+/// probes for X (Firefox does) would otherwise open an empty X window.
+///
 /// The status goes through a file because waypipe's `server` mode returns 0
 /// whatever its command did, so it cannot be read off the SSH exit status.
-pub fn gui_script(cwd: Option<&str>, command: &[String], rc_file: &str) -> String {
+pub fn gui_script(cwd: Option<&str>, command: &[String], rc_file: &str, x11: bool) -> String {
+    gui_script_in(cwd, command, rc_file, x11.then_some(X11_DIR))
+}
+
+fn gui_script_in(
+    cwd: Option<&str>,
+    command: &[String],
+    rc_file: &str,
+    x11_dir: Option<&str>,
+) -> String {
     let mut script = String::new();
     if let Some(dir) = cwd {
         script.push_str(&format!("cd {} 2>/dev/null; ", sh_quote(dir)));
+    }
+    if let Some(dir) = x11_dir {
+        script.push_str(&x11_setup(dir));
     }
     script.push_str("env");
     for (k, v) in GUEST_ENV {
@@ -458,6 +493,41 @@ pub fn gui_script(cwd: Option<&str>, command: &[String], rc_file: &str) -> Strin
         sh_quote(rc_file)
     ));
     script
+}
+
+/// Guest shell that makes an X server available, for apps that cannot speak
+/// Wayland. The guest has no X server of its own, so it runs Xwayland: a
+/// Wayland client, so its windows travel through waypipe like any other.
+///
+/// It is started only when an app connects (socket activation), so Wayland
+/// apps never see it and no empty X window opens on the desktop. It is a
+/// single window holding the X apps; there is no window manager to arrange
+/// them. When the command ends, the listener and Xwayland are stopped.
+///
+/// A guest made before Xwayland was one of its packages gets it installed,
+/// once, the first time. Without Xwayland, or without a socket directory,
+/// there is simply no `DISPLAY`, as before.
+fn x11_setup(dir: &str) -> String {
+    const SCRIPT: &str = r#"d=@DIR@
+if ! command -v Xwayland >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    echo 'vmmbox: installing Xwayland, for X11 apps (once)...' >&2
+    sudo -n timeout 300 sh -c 'apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xwayland' >/dev/null 2>&1
+  elif command -v dnf >/dev/null 2>&1; then
+    echo 'vmmbox: installing Xwayland, for X11 apps (once)...' >&2
+    sudo -n timeout 300 dnf install -y -q xorg-x11-server-Xwayland >/dev/null 2>&1
+  fi
+fi
+if command -v Xwayland >/dev/null 2>&1 && command -v systemd-socket-activate >/dev/null 2>&1 && [ -d "$d" ]; then
+  x=20
+  while [ -e "$d/X$x" ] || [ -e /tmp/.X$x-lock ]; do x=$((x+1)); done
+  systemd-socket-activate -E XDG_RUNTIME_DIR -E WAYLAND_DISPLAY -l "$d/X$x" sh -c "exec Xwayland :$x -listenfd 3 -geometry 1280x800 -noreset -shm -decorate" >/dev/null 2>&1 &
+  xp=$!
+  trap "kill $xp 2>/dev/null; pkill -f '^Xwayland :$x ' 2>/dev/null; rm -f '$d/X$x' /tmp/.X$x-lock" EXIT
+  export DISPLAY=:$x
+fi
+"#;
+    SCRIPT.replace("@DIR@", &sh_quote(dir))
 }
 
 /// The line the guest's login shell runs. The script travels as one quoted
@@ -600,6 +670,24 @@ mod script_tests {
     }
 
     #[test]
+    fn x11_only_programs_are_recognised_however_they_are_launched() {
+        let needs = |words: &[&str]| needs_x11(&cands(words));
+        assert!(needs(&["vlc"]));
+        assert!(needs(&["/usr/bin/vlc", "movie.mkv"]));
+        assert!(needs(&["bash", "-c", "cd /tmp && vlc"]));
+        assert!(needs(&["env", "FOO=1", "xeyes"]));
+        assert!(needs(&["sudo", "-n", "xterm"]));
+        // Wayland-capable apps are left alone: giving them an X server would
+        // let a mere probe of it open an empty window.
+        assert!(!needs(&["firefox"]));
+        assert!(!needs(&["foot"]));
+        assert!(!needs(&["google-chrome", "--incognito"]));
+        assert!(!needs(&["bash"]));
+        assert!(!needs(&["cvlcish"]));
+        assert!(!needs(&[]));
+    }
+
+    #[test]
     fn wrappers_are_looked_through() {
         assert_eq!(cands(&["env", "FOO=1", "google-chrome"]), ["google-chrome"]);
         assert_eq!(cands(&["sudo", "-n", "foot"]), ["foot"]);
@@ -611,7 +699,7 @@ mod script_tests {
     fn script_survives_a_real_shell() {
         let rc = std::env::temp_dir().join(format!("vmmbox-rc-a-{}", std::process::id()));
         let cmd = ["printf", "[%s]", "a b", "it's", "$HOME;x"].map(String::from);
-        let script = gui_script(Some("/tmp"), &cmd, &rc.to_string_lossy());
+        let script = gui_script(Some("/tmp"), &cmd, &rc.to_string_lossy(), false);
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(&script)
@@ -630,7 +718,7 @@ mod script_tests {
     #[test]
     fn script_sets_the_wayland_environment() {
         let rc = std::env::temp_dir().join(format!("vmmbox-rc-b-{}", std::process::id()));
-        let script = gui_script(None, &["env".to_string()], &rc.to_string_lossy());
+        let script = gui_script(None, &["env".to_string()], &rc.to_string_lossy(), false);
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(&script)
@@ -649,7 +737,7 @@ mod script_tests {
         let rc = std::env::temp_dir().join(format!("vmmbox-rc-{tag}-{}", std::process::id()));
         let rc = rc.to_string_lossy().into_owned();
         let cmd: Vec<String> = command.iter().map(|s| s.to_string()).collect();
-        let line = gui_server_command("/tmp/s.sock", &gui_script(None, &cmd, &rc), &rc);
+        let line = gui_server_command("/tmp/s.sock", &gui_script(None, &cmd, &rc, false), &rc);
         let fake = format!(
             "waypipe() {{ while [ \"$1\" != -- ]; do shift; done; shift; \"$@\"; return 0; }}; {line}"
         );
@@ -700,6 +788,7 @@ mod script_tests {
             Some("/Users/me/my proj"),
             &["foot".to_string(), "-e".into(), "ls".into()],
             "/tmp/rc",
+            false,
         );
         let line = gui_server_command("/tmp/s.sock", &script, "/tmp/rc");
         assert!(line.starts_with(
@@ -825,5 +914,254 @@ mod script_tests {
             .unwrap();
         assert_eq!(out.status.code(), Some(1));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A fresh, empty scratch directory.
+    fn temp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("vmmbox-gui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A directory of stand-in programs, used as the whole `PATH`, so a test
+    /// of the X11 setup never sees (or runs) the host's own Xwayland or
+    /// package manager. The few real tools the script needs are linked in.
+    struct Stubs {
+        dir: PathBuf,
+    }
+
+    impl Stubs {
+        fn new(tag: &str) -> Self {
+            let dir = temp(&format!("x11-{tag}"));
+            for tool in [
+                "env", "rm", "sh", "sleep", "cat", "true", "dirname", "chmod",
+            ] {
+                let real = ["/usr/bin", "/bin"]
+                    .iter()
+                    .map(|d| Path::new(d).join(tool))
+                    .find(|p| p.exists())
+                    .unwrap();
+                let _ = std::fs::remove_file(dir.join(tool));
+                std::os::unix::fs::symlink(real, dir.join(tool)).unwrap();
+            }
+            Self { dir }
+        }
+
+        fn add(&self, name: &str, body: &str) {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        /// Run `command` as the GUI script, with X sockets in `x_dir` and
+        /// only these programs available. Returns (stdout, stderr, rc).
+        fn run(&self, x_dir: &Path, command: &[&str]) -> (String, String, Option<i32>) {
+            let rc = self.dir.join("rc-file");
+            let cmd: Vec<String> = command.iter().map(|s| s.to_string()).collect();
+            let script = gui_script_in(None, &cmd, &rc.to_string_lossy(), x_dir.to_str());
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .env_clear()
+                .env("PATH", &self.dir)
+                .env("WAYLAND_DISPLAY", "wayland-test")
+                .output()
+                .unwrap();
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+                out.status.code(),
+            )
+        }
+    }
+
+    /// A `systemd-socket-activate` stand-in: record the arguments and the pid,
+    /// create the socket path as the real one would, then wait to be killed.
+    const FAKE_ACTIVATE: &str = r#"
+echo "$@" > "$(dirname "$0")/activate.args"
+echo $$ > "$(dirname "$0")/activate.pid"
+while [ "$1" != -l ]; do shift; done
+: > "$2"
+exec sleep 60"#;
+
+    /// An app stand-in that waits until the listener stand-in has started
+    /// (it is launched in the background), then prints its environment.
+    fn add_app(stubs: &Stubs) {
+        stubs.add(
+            "app",
+            r#"d="$(dirname "$0")"
+n=0
+while [ ! -e "$d/activate.pid" ] && [ $n -lt 100 ]; do sleep 0.1; n=$((n+1)); done
+exec env"#,
+        );
+    }
+
+    /// Whether the environment listing sets `DISPLAY` (not `WAYLAND_DISPLAY`).
+    fn sets_display(out: &str) -> bool {
+        out.lines().any(|l| l.starts_with("DISPLAY="))
+    }
+
+    fn alive(pid: &str) -> bool {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -0 {pid}"))
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    #[test]
+    fn an_x_server_is_offered_and_started_only_when_an_app_connects() {
+        let stubs = Stubs::new("offer");
+        stubs.add("Xwayland", "exit 0");
+        stubs.add("systemd-socket-activate", FAKE_ACTIVATE);
+        add_app(&stubs);
+        let xdir = temp("x11-offer-sockets");
+        let (out, err, rc) = stubs.run(&xdir, &["app"]);
+        assert_eq!(rc, Some(0), "{err}");
+        // The app finds an X display, and it is the lazily-started one.
+        assert!(out.lines().any(|l| l == "DISPLAY=:20"), "{out}");
+        let args = std::fs::read_to_string(stubs.dir.join("activate.args")).unwrap();
+        assert!(
+            args.contains(&format!("-l {}/X20", xdir.display())),
+            "{args}"
+        );
+        // Activated, not launched: the listener hands Xwayland the socket.
+        assert!(
+            args.contains(
+                "exec Xwayland :20 -listenfd 3 -geometry 1280x800 -noreset -shm -decorate"
+            ),
+            "{args}"
+        );
+        // The Wayland session it must connect to is passed along.
+        assert!(
+            args.contains("-E XDG_RUNTIME_DIR -E WAYLAND_DISPLAY"),
+            "{args}"
+        );
+        // The Wayland environment is untouched.
+        assert!(out.contains("QT_QPA_PLATFORM=wayland"), "{out}");
+    }
+
+    #[test]
+    fn the_x_server_is_cleaned_up_when_the_command_ends() {
+        let stubs = Stubs::new("cleanup");
+        stubs.add("Xwayland", "exit 0");
+        stubs.add("systemd-socket-activate", FAKE_ACTIVATE);
+        add_app(&stubs);
+        let xdir = temp("x11-cleanup-sockets");
+        let (_, _, rc) = stubs.run(&xdir, &["app"]);
+        assert_eq!(rc, Some(0));
+        let pid = std::fs::read_to_string(stubs.dir.join("activate.pid")).unwrap();
+        // Give the kill a moment to land.
+        let mut gone = false;
+        for _ in 0..50 {
+            if !alive(pid.trim()) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(gone, "the listener (pid {pid}) outlived the command");
+        assert!(!xdir.join("X20").exists(), "the socket was left behind");
+    }
+
+    #[test]
+    fn the_exit_status_is_unchanged_by_the_x_server() {
+        let stubs = Stubs::new("rc");
+        stubs.add("Xwayland", "exit 0");
+        stubs.add("systemd-socket-activate", FAKE_ACTIVATE);
+        stubs.add("fails", "exit 7");
+        let xdir = temp("x11-rc-sockets");
+        let (_, _, rc) = stubs.run(&xdir, &["fails"]);
+        assert_eq!(rc, Some(7));
+        let recorded = std::fs::read_to_string(stubs.dir.join("rc-file")).unwrap();
+        assert_eq!(recorded.trim(), "7");
+    }
+
+    #[test]
+    fn an_x_display_in_use_is_skipped() {
+        let stubs = Stubs::new("busy");
+        stubs.add("Xwayland", "exit 0");
+        stubs.add("systemd-socket-activate", FAKE_ACTIVATE);
+        let xdir = temp("x11-busy-sockets");
+        std::fs::write(xdir.join("X20"), b"").unwrap();
+        std::fs::write(xdir.join("X21"), b"").unwrap();
+        let (out, _, _) = stubs.run(&xdir, &["env"]);
+        assert!(out.lines().any(|l| l == "DISPLAY=:22"), "{out}");
+        // Someone else's sockets are not ours to remove.
+        assert!(xdir.join("X20").exists() && xdir.join("X21").exists());
+    }
+
+    #[test]
+    fn without_xwayland_or_a_way_to_get_it_there_is_no_display() {
+        let stubs = Stubs::new("none");
+        let xdir = temp("x11-none-sockets");
+        let (out, err, rc) = stubs.run(&xdir, &["env"]);
+        assert_eq!(rc, Some(0), "{err}");
+        assert!(!sets_display(&out), "{out}");
+        assert!(
+            !err.contains("installing"),
+            "nothing to install with: {err}"
+        );
+        assert!(
+            out.contains("QT_QPA_PLATFORM=wayland"),
+            "the command still runs: {out}"
+        );
+    }
+
+    #[test]
+    fn without_a_socket_directory_there_is_no_display() {
+        let stubs = Stubs::new("nodir");
+        stubs.add("Xwayland", "exit 0");
+        stubs.add("systemd-socket-activate", FAKE_ACTIVATE);
+        let (out, _, rc) = stubs.run(Path::new("/nonexistent/vmmbox-x11"), &["env"]);
+        assert_eq!(rc, Some(0));
+        assert!(!sets_display(&out), "{out}");
+    }
+
+    #[test]
+    fn a_guest_without_xwayland_installs_it_once_with_apt() {
+        let stubs = Stubs::new("apt");
+        stubs.add("systemd-socket-activate", FAKE_ACTIVATE);
+        stubs.add("sudo", r#"while [ "$1" = -n ]; do shift; done; exec "$@""#);
+        stubs.add("timeout", r#"shift; exec "$@""#);
+        // "Installing" makes the Xwayland stand-in appear.
+        stubs.add(
+            "apt-get",
+            &format!(
+                r#"echo "$@" >> "{d}/apt.log"; [ "$1" = install ] && printf '#!/bin/sh\nexit 0\n' > "{d}/Xwayland" && chmod +x "{d}/Xwayland"; exit 0"#,
+                d = stubs.dir.display()
+            ),
+        );
+        let xdir = temp("x11-apt-sockets");
+        let (out, err, rc) = stubs.run(&xdir, &["env"]);
+        assert_eq!(rc, Some(0), "{err}");
+        assert!(err.contains("installing Xwayland"), "{err}");
+        let log = std::fs::read_to_string(stubs.dir.join("apt.log")).unwrap();
+        assert!(log.contains("install -y -qq xwayland"), "{log}");
+        assert!(out.lines().any(|l| l == "DISPLAY=:20"), "{out}");
+
+        // Now that it is there, a second run installs nothing.
+        let _ = std::fs::remove_file(stubs.dir.join("apt.log"));
+        let (_, err, _) = stubs.run(&xdir, &["true"]);
+        assert!(!err.contains("installing"), "{err}");
+        assert!(!stubs.dir.join("apt.log").exists());
+    }
+
+    #[test]
+    fn a_failed_install_does_not_stop_the_app() {
+        let stubs = Stubs::new("dnf-fails");
+        stubs.add("sudo", r#"while [ "$1" = -n ]; do shift; done; exec "$@""#);
+        stubs.add("timeout", r#"shift; exec "$@""#);
+        stubs.add("dnf", "exit 1");
+        let xdir = temp("x11-dnf-sockets");
+        let (out, err, rc) = stubs.run(&xdir, &["env"]);
+        assert_eq!(rc, Some(0), "{err}");
+        assert!(err.contains("installing Xwayland"), "{err}");
+        assert!(!sets_display(&out), "{out}");
+        assert!(out.contains("XDG_SESSION_TYPE=wayland"), "{out}");
     }
 }

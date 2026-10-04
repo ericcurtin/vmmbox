@@ -557,7 +557,7 @@ pub enum GuiMode {
     Never,
 }
 
-pub fn run(r: &ImageRef, command: &[String], mode: GuiMode) -> Result<i32> {
+pub fn run(r: &ImageRef, command: &[String], mode: GuiMode, x11: bool) -> Result<i32> {
     let paths = Paths::discover()?;
     let platform = Platform::current()?;
     // The VM is pulled, created and started first if that is still to do.
@@ -578,18 +578,23 @@ pub fn run(r: &ImageRef, command: &[String], mode: GuiMode) -> Result<i32> {
     // What this command would actually run: itself, or what is inside a
     // `bash -c "..."` or behind `env`/`sudo`.
     let candidates = gui::gui_candidates(command);
+    // Software with no Wayland support needs an X server as well; it is a GUI
+    // app whether or not it has a launcher file.
+    let x11_only = gui::needs_x11(&candidates);
     let use_gui = match (&mode, &gui) {
         (GuiMode::Never, _) => false,
         (GuiMode::Always, Err(e)) => bail!("{e}"),
         (GuiMode::Always, Ok(_)) => true,
         (GuiMode::Auto, Ok(_)) => {
-            !candidates.is_empty() && ssh.run_quiet(&gui::gui_check_script(&candidates))? == 0
+            x11_only
+                || (!candidates.is_empty()
+                    && ssh.run_quiet(&gui::gui_check_script(&candidates))? == 0)
         }
         (GuiMode::Auto, Err(_)) => false,
     };
 
     if use_gui && let Ok(gui) = &gui {
-        return gui.run(&paths, &ssh, tty, cwd.as_deref(), command);
+        return gui.run(&paths, &ssh, tty, cwd.as_deref(), command, x11 || x11_only);
     }
 
     let remote = remote_command(cwd.as_deref(), command);
