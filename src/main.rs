@@ -43,8 +43,9 @@ enum Command {
         /// Distro name of the VM
         name: ImageRef,
     },
-    /// Run a command in a running VM as your user, in your current directory.
-    /// GUI apps (e.g. google-chrome) open as windows on your desktop.
+    /// Run a command in a VM as your user, in your current directory. The VM is
+    /// pulled, created and started first if need be. GUI apps (e.g.
+    /// google-chrome) open as windows on your desktop.
     Exec {
         /// Open as a GUI app even if vmmbox doesn't recognise the command as one
         /// (needed to start GUI apps from a shell: `exec --gui ubuntu bash`)

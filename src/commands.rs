@@ -195,20 +195,45 @@ fn check_version(vm: &Vm, r: &ImageRef) -> Result<()> {
 pub fn start(r: &ImageRef) -> Result<()> {
     let platform = Platform::current()?;
     let paths = Paths::discover()?;
-    let name = r.distro.name;
-
-    let existing = vm::load(&paths, name)?;
-    if let Some(vm) = &existing {
-        check_version(vm, r)?;
-        if let Some(pid) = vm.running_pid() {
-            println!("{name} is already running (pid {pid})");
-            return Ok(());
+    let (vm, booted) = ensure_running(&paths, platform, r)?;
+    match booted {
+        Some(b) => print_summary(&paths, platform, &vm, &b),
+        None => {
+            if let Some(pid) = vm.running_pid() {
+                println!("{} is already running (pid {pid})", vm.state.name);
+            }
         }
     }
+    Ok(())
+}
+
+/// What booting a VM did, for the summary `start` prints.
+struct Booted {
+    elapsed: Duration,
+    gpu: std::result::Result<Gpu, String>,
+}
+
+/// Make sure the VM for `r` is running: pull its image, create the VM and boot
+/// it, whichever of those is still to do. The boot report is `None` if it was
+/// already running. Everything this prints goes to stderr, so a command run
+/// through `exec` keeps its stdout to itself.
+fn ensure_running(paths: &Paths, platform: Platform, r: &ImageRef) -> Result<(Vm, Option<Booted>)> {
+    let name = r.distro.name;
+
+    let existing = match vm::load(paths, name)? {
+        Some(vm) => {
+            check_version(&vm, r)?;
+            if vm.running_pid().is_some() {
+                return Ok((vm, None));
+            }
+            Some(vm)
+        }
+        None => None,
+    };
 
     // Check every prerequisite up front, before downloading gigabytes.
     platform.check_accel()?;
-    let qemu = Qemu::locate(platform, &paths)?;
+    let qemu = Qemu::locate(platform, paths)?;
     qemu.require_accel(platform.accel())?;
     Ssh::require_client()?;
 
@@ -217,14 +242,15 @@ pub fn start(r: &ImageRef) -> Result<()> {
         None => {
             let user = host::current_user()?;
             let version = r.version_or_default();
-            let images = Images::new(&paths);
+            let images = Images::new(paths);
             let image = images.ensure(&Http::new()?, r.distro, &version, platform.arch)?;
             eprintln!("Creating VM '{name}' from {}...", image.reference());
             let base = images.disk_path(&image.distro, &image.version, platform.arch);
-            vm::create(&paths, platform, &qemu, &user, &image, &base)?
+            vm::create(paths, platform, &qemu, &user, &image, &base)?
         }
     };
-    boot(&paths, platform, &qemu, &mut vm)
+    let booted = boot(paths, platform, &qemu, &mut vm)?;
+    Ok((vm, Some(booted)))
 }
 
 fn free_port() -> Result<u16> {
@@ -232,7 +258,7 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<()> {
+fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<Booted> {
     let name = vm.state.name.clone();
     let compute = resources::compute();
     let ssh_port = free_port()?;
@@ -274,7 +300,7 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<(
     };
     let args = args_for(gpu.as_ref().ok())?;
 
-    let first_boot = vm.state.started_at.is_none();
+    let first_boot = !vm.state.booted_before;
     let started = Instant::now();
     eprintln!(
         "Starting {name}: {} CPUs, {} memory, {} accelerated",
@@ -352,6 +378,8 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<(
         eprintln!("First boot: installing packages and configuring the guest...");
     }
     let _ = ssh.run_quiet("sudo -n timeout 300 cloud-init status --wait");
+    vm.state.booted_before = true;
+    vm.save()?;
     if let Some(path) = vm.state.shared_home_path() {
         let probe = format!("mountpoint -q {}", sh_quote(path));
         if ssh.run_quiet(&probe)? != 0 {
@@ -363,16 +391,24 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<(
         }
     }
 
+    Ok(Booted {
+        elapsed: started.elapsed(),
+        gpu,
+    })
+}
+
+fn print_summary(paths: &Paths, platform: Platform, vm: &Vm, booted: &Booted) {
     let s = &vm.state;
+    let name = &s.name;
     println!(
         "Started {name} ({}) in {}s",
         vm.reference(),
-        started.elapsed().as_secs()
+        booted.elapsed.as_secs()
     );
     println!("  CPUs:   {}", s.cpus);
     println!("  Memory: {}", format_bytes(s.memory_bytes));
     println!("  Disk:   {} (grows on demand)", format_bytes(s.disk_bytes));
-    match &gpu {
+    match &booted.gpu {
         Ok(g) => println!("  GPU:    {}", g.describe()),
         Err(why) => println!("  GPU:    {why}"),
     }
@@ -392,7 +428,6 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<(
         Err(e) => println!("  GUI:    unavailable: {e}"),
     }
     println!("Run `vmmbox exec {name} bash` for a shell.");
-    Ok(())
 }
 
 fn wait_exit(pid: u32, timeout: Duration) -> bool {
@@ -524,19 +559,21 @@ pub enum GuiMode {
 
 pub fn exec(r: &ImageRef, command: &[String], mode: GuiMode) -> Result<i32> {
     let paths = Paths::discover()?;
-    let vm = existing_vm(&paths, r)?;
+    let platform = Platform::current()?;
+    // The VM is pulled, created and started first if that is still to do.
+    let (vm, booted) = ensure_running(&paths, platform, r)?;
     let name = &vm.state.name;
-    if !vm.is_running() {
-        bail!("{name} is not running; start it with `vmmbox start {name}`");
-    }
     let ssh = Ssh::for_vm(&vm)?;
+    match booted {
+        Some(b) => eprintln!("Started {name} in {}s", b.elapsed.as_secs()),
+        None => await_ssh(&ssh, &vm, BOOT_TIMEOUT.as_secs())?,
+    }
     let cwd = guest_cwd(&vm);
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
 
     // GUI apps go through waypipe. Plain commands do not, so terminal use stays
     // as fast and as simple as ssh: a GUI-ness check (one short ssh call) only
     // runs for commands that could plausibly be GUI apps.
-    let platform = Platform::current()?;
     let gui = Gui::detect(platform, &paths);
     // What this command would actually run: itself, or what is inside a
     // `bash -c "..."` or behind `env`/`sudo`.
@@ -571,6 +608,35 @@ pub fn exec(r: &ImageRef, command: &[String], mode: GuiMode) -> Result<i32> {
         eprintln!("vmmbox: this looks like a GUI app, but {reason}");
     }
     Ok(code)
+}
+
+/// Another `vmmbox` may be booting this VM right now, which makes it "running"
+/// before it answers on SSH. If it was started recently, wait for it rather
+/// than fail. A VM that has been up a while is not probed: that would cost a
+/// connection on every command.
+fn await_ssh(ssh: &Ssh, vm: &Vm, limit: u64) -> Result<()> {
+    let Some(since) = vm
+        .state
+        .started_at
+        .filter(|&t| now_secs().saturating_sub(t) < limit)
+    else {
+        return Ok(());
+    };
+    if ssh.probe() {
+        return Ok(());
+    }
+    eprintln!("Waiting for {} to finish booting...", vm.state.name);
+    while !ssh.probe() {
+        if now_secs().saturating_sub(since) >= limit {
+            bail!(
+                "{} is running but did not accept SSH within {limit}s; see {}",
+                vm.state.name,
+                vm.console_log().display()
+            );
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Ok(())
 }
 
 /// The host working directory as seen from the guest, if it is inside the
@@ -643,6 +709,7 @@ mod tests {
             guest_home: "/home/me".into(),
             host_home: "/Users/me".into(),
             home_shared: true,
+            booted_before: true,
             pid,
             ssh_port: 2222,
             started_at: None,
@@ -676,6 +743,55 @@ mod tests {
         std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
         std::fs::write(dir.join("disk.qcow2"), vec![0u8; size]).unwrap();
         dir
+    }
+
+    /// A stopped VM loaded back from disk, whose SSH port nothing listens on.
+    fn closed_port_vm(paths: &Paths, started_secs_ago: u64) -> Vm {
+        fake_vm(paths, "ubuntu", "26.04", 10, None);
+        let mut vm = vm::load(paths, "ubuntu").unwrap().unwrap();
+        vm.state.ssh_port = free_port().unwrap();
+        vm.state.started_at = Some(now_secs() - started_secs_ago);
+        vm
+    }
+
+    #[test]
+    fn exec_does_not_probe_a_vm_that_has_been_up_a_while() {
+        let (paths, root) = scratch("await-old");
+        let vm = closed_port_vm(&paths, 10_000);
+        let Ok(ssh) = Ssh::for_vm(&vm) else { return };
+        // Nothing is listening, so a probe would fail; it must not even try.
+        let began = Instant::now();
+        assert!(await_ssh(&ssh, &vm, 300).is_ok());
+        assert!(began.elapsed() < Duration::from_secs(3));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn exec_waits_for_a_vm_that_is_still_booting_then_gives_up() {
+        let (paths, root) = scratch("await-new");
+        let vm = closed_port_vm(&paths, 1);
+        let Ok(ssh) = Ssh::for_vm(&vm) else { return };
+        let began = Instant::now();
+        let err = await_ssh(&ssh, &vm, 2).unwrap_err().to_string();
+        assert!(err.contains("did not accept SSH within 2s"), "{err}");
+        assert!(began.elapsed() >= Duration::from_millis(900));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn records_from_before_booted_before_existed_count_as_booted() {
+        let (paths, root) = scratch("booted-default");
+        let dir = fake_vm(&paths, "ubuntu", "26.04", 10, None);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("vm.json")).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("booted_before");
+        std::fs::write(dir.join("vm.json"), serde_json::to_vec(&json).unwrap()).unwrap();
+        let vm = vm::load(&paths, "ubuntu").unwrap().unwrap();
+        assert!(
+            vm.state.booted_before,
+            "an old VM must not claim a first boot"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

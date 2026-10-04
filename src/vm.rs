@@ -35,6 +35,10 @@ pub struct VmState {
     /// match; otherwise `guest_home` is a plain directory on the VM's disk.
     pub host_home: String,
     pub home_shared: bool,
+    /// Whether the VM has been up before. First boot installs packages, so it
+    /// is slower and says so. VMs recorded before this field existed have run.
+    #[serde(default = "yes")]
+    pub booted_before: bool,
 
     // Runtime state, updated on start/stop.
     #[serde(default)]
@@ -47,6 +51,10 @@ pub struct VmState {
     pub cpus: u32,
     #[serde(default)]
     pub memory_bytes: u64,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl VmState {
@@ -265,6 +273,7 @@ fn build(
         home_shared,
         pid: None,
         ssh_port: 0,
+        booted_before: false,
         started_at: None,
         cpus: 0,
         memory_bytes: 0,
