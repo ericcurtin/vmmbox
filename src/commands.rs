@@ -988,12 +988,23 @@ mod tests {
         use std::process::Stdio;
         let bin = root.join("qemu-fake");
         std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap();
-        let mut child = std::process::Command::new(&bin)
-            .args(["--ignored", "--exact", "commands::tests::fake_qemu_sleeper"])
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.args(["--ignored", "--exact", "commands::tests::fake_qemu_sleeper"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        // Another test forking while the copy was still open for writing makes
+        // the first exec fail with "Text file busy". That passes in moments.
+        let mut tries = 0;
+        let mut child = loop {
+            match cmd.spawn() {
+                Ok(child) => break child,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 200 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => panic!("starting the fake qemu: {e}"),
+            }
+        };
         // Wait until vmmbox itself recognises it.
         for _ in 0..100 {
             if crate::proc::is_qemu(child.id()) {
@@ -1056,8 +1067,13 @@ mod tests {
 
     #[test]
     fn free_port_is_usable() {
-        let p = free_port().unwrap();
-        assert!(p > 0);
-        assert!(TcpListener::bind(("127.0.0.1", p)).is_ok());
+        // The port is released before it is returned, so another test binding
+        // port 0 can take it in between. That race is inherent in picking a free
+        // port; a few tries make the test about the function, not the race.
+        let usable = (0..10).any(|_| {
+            let p = free_port().unwrap();
+            p > 0 && TcpListener::bind(("127.0.0.1", p)).is_ok()
+        });
+        assert!(usable);
     }
 }
