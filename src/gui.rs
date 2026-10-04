@@ -305,28 +305,113 @@ fn start_cocoa_way(bin: &Path, log: &Path) -> Result<WaylandSocket> {
     }
 }
 
-/// Commands that are never GUI apps; skip the guest check for them so plain
-/// shells start without an extra round trip.
-const NEVER_GUI: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "ksh"];
+/// Shells. Running one with `-c script` runs that script; with nothing to run it
+/// is interactive or runs a script file, neither of which we can see into.
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "ksh"];
 
-/// Whether `command` is worth checking in the guest at all.
-pub fn worth_checking(command: &[String]) -> bool {
-    let Some(first) = command.first() else {
-        return false;
-    };
-    let base = first.rsplit('/').next().unwrap_or(first);
-    !NEVER_GUI.contains(&base)
+/// Words that run another command given in their arguments, or merely prefix
+/// one (shell keywords). Looked through to find the command that really runs.
+const WRAPPERS: &[&str] = &[
+    "exec", "env", "sudo", "nohup", "setsid", "time", "command", "nice", "stdbuf", "if", "then",
+    "else", "elif", "do", "while", "until", "!",
+];
+
+fn basename(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
 }
 
-/// A guest script that exits 0 when `command` resolves to the program behind
-/// some installed, non-terminal `.desktop` launcher, i.e. a GUI application.
-/// Matching goes through `readlink -f` so wrappers and `alternatives` links
-/// (`google-chrome` -> `google-chrome-stable`) resolve to the same target.
-pub fn gui_check_script(command: &str) -> String {
+/// `NAME=value`, an environment assignment prefixing a command.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// The program a command line runs, after any wrappers and assignments.
+fn program_after_wrappers(words: &[&str]) -> Option<String> {
+    let mut seen_wrapper = false;
+    for word in words {
+        if is_assignment(word) {
+            continue;
+        }
+        if WRAPPERS.contains(&basename(word)) {
+            seen_wrapper = true;
+            continue;
+        }
+        // Options of a wrapper (`sudo -n`, `env -i`) come before the program.
+        if seen_wrapper && word.starts_with('-') {
+            continue;
+        }
+        let word = word.trim_matches(|c| c == '\'' || c == '"');
+        // Expansions cannot be resolved without running them.
+        return (!word.is_empty() && !word.contains('$')).then(|| word.to_string());
+    }
+    None
+}
+
+/// The `-c` script of a shell invocation (`-c`, `-lc`, `-o pipefail -c`...).
+fn shell_script(args: &[String]) -> Option<&str> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "-o" || arg == "+o" {
+            it.next(); // takes an option name
+        } else if !arg.starts_with("--")
+            && let Some(flags) = arg.strip_prefix('-')
+            && flags.contains('c')
+        {
+            return it.next().map(String::as_str);
+        } else if !arg.starts_with('-') && !arg.starts_with('+') {
+            return None; // a script file
+        }
+    }
+    None
+}
+
+/// The commands `command` would run that are worth checking for being GUI apps:
+/// its own program, or, for `bash -c "..."`, the programs in the script. A
+/// shell with no script, or one running a script file, gives none; use `--gui`.
+pub fn gui_candidates(command: &[String]) -> Vec<String> {
+    let Some(first) = command.first() else {
+        return Vec::new();
+    };
+    if SHELLS.contains(&basename(first)) {
+        let Some(script) = shell_script(&command[1..]) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for segment in script.split([';', '&', '|', '\n', '(', ')', '{', '}']) {
+            let words: Vec<&str> = segment.split_whitespace().collect();
+            if let Some(program) = program_after_wrappers(&words)
+                && !out.contains(&program)
+            {
+                out.push(program);
+            }
+        }
+        return out;
+    }
+    let words: Vec<&str> = command.iter().map(String::as_str).collect();
+    program_after_wrappers(&words).into_iter().collect()
+}
+
+/// A guest script that exits 0 when any of `candidates` resolves to the program
+/// behind some installed, non-terminal `.desktop` launcher, i.e. a GUI
+/// application. Matching goes through `readlink -f` so wrappers and
+/// `alternatives` links (`google-chrome` -> `google-chrome-stable`) resolve to
+/// the same target. One call covers every candidate.
+pub fn gui_check_script(candidates: &[String]) -> String {
+    let words: Vec<String> = candidates.iter().map(|c| sh_quote(c)).collect();
     let script = format!(
-        r#"c={cmd}
-p=$(command -v -- "$c" 2>/dev/null) || exit 1
-r=$(readlink -f -- "$p" 2>/dev/null) || r=$p
+        r#"set -- {words}
+nl='
+'
+real=""
+for c in "$@"; do
+  p=$(command -v -- "$c" 2>/dev/null) || continue
+  case "$p" in /*) r=$(readlink -f -- "$p" 2>/dev/null) || r=$p; real="$real$r$nl";; esac
+done
+[ -n "$real" ] || exit 1
 files=$(ls /usr/share/applications/*.desktop /usr/local/share/applications/*.desktop "$HOME"/.local/share/applications/*.desktop /var/lib/flatpak/exports/share/applications/*.desktop 2>/dev/null)
 [ -n "$files" ] || exit 1
 paths=""
@@ -334,9 +419,14 @@ for e in $(grep -L '^Terminal=true' $files 2>/dev/null | xargs -r sed -n 's/^Exe
   q=$(command -v -- "$e" 2>/dev/null) && paths="$paths $q"
 done
 [ -n "$paths" ] || exit 1
-printf '%s\n' $paths | xargs -r readlink -f -- 2>/dev/null | grep -qxF -- "$r"
+resolved=$(printf '%s\n' $paths | xargs -r readlink -f -- 2>/dev/null)
+IFS=$nl
+for r in $real; do
+  case "$nl$resolved$nl" in *"$nl$r$nl"*) exit 0;; esac
+done
+exit 1
 "#,
-        cmd = sh_quote(command)
+        words = words.join(" ")
     );
     format!("sh -c {}", sh_quote(&script))
 }
@@ -439,14 +529,79 @@ mod tests {
 mod script_tests {
     use super::*;
 
+    fn cands(words: &[&str]) -> Vec<String> {
+        gui_candidates(&words.iter().map(|w| w.to_string()).collect::<Vec<_>>())
+    }
+
     #[test]
-    fn shells_are_not_checked() {
-        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        assert!(!worth_checking(&v(&["bash"])));
-        assert!(!worth_checking(&v(&["/bin/zsh", "-l"])));
-        assert!(!worth_checking(&[]));
-        assert!(worth_checking(&v(&["google-chrome"])));
-        assert!(worth_checking(&v(&["ls", "-la"])));
+    fn a_plain_command_is_its_own_candidate() {
+        assert_eq!(cands(&["google-chrome"]), ["google-chrome"]);
+        assert_eq!(cands(&["ls", "-la"]), ["ls"]);
+        assert_eq!(
+            cands(&["/opt/google/chrome/chrome", "--incognito"]),
+            ["/opt/google/chrome/chrome"]
+        );
+        assert!(cands(&[]).is_empty());
+    }
+
+    #[test]
+    fn interactive_shells_and_script_files_are_not_checked() {
+        // Nothing to look into: `--gui` is the way to start a GUI app from one.
+        assert!(cands(&["bash"]).is_empty());
+        assert!(cands(&["/bin/zsh", "-l"]).is_empty());
+        assert!(cands(&["bash", "script.sh"]).is_empty());
+        assert!(cands(&["sh", "-i"]).is_empty());
+    }
+
+    #[test]
+    fn a_shell_c_script_is_judged_by_what_it_runs() {
+        // The reported bug: `vmmbox exec fedora bash -c google-chrome`.
+        assert_eq!(cands(&["bash", "-c", "google-chrome"]), ["google-chrome"]);
+        assert_eq!(cands(&["sh", "-c", "foot"]), ["foot"]);
+        assert_eq!(
+            cands(&["bash", "-lc", "google-chrome --incognito"]),
+            ["google-chrome"]
+        );
+        assert_eq!(cands(&["bash", "-o", "pipefail", "-c", "foot"]), ["foot"]);
+        assert_eq!(cands(&["bash", "-c", "'google-chrome'"]), ["google-chrome"]);
+    }
+
+    #[test]
+    fn every_command_in_a_script_is_a_candidate() {
+        let c = cands(&[
+            "bash",
+            "-c",
+            "cd /tmp && FOO=1 exec google-chrome --new-window; echo done",
+        ]);
+        assert!(c.contains(&"google-chrome".to_string()), "{c:?}");
+        assert!(
+            c.contains(&"cd".to_string()) && c.contains(&"echo".to_string()),
+            "{c:?}"
+        );
+        // Pipes, background jobs and subshells, and keywords are looked through.
+        for script in [
+            "foot &",
+            "sleep 1 | foot",
+            "(foot)",
+            "{ foot; }",
+            "if true; then foot; fi",
+        ] {
+            assert!(
+                cands(&["sh", "-c", script]).contains(&"foot".to_string()),
+                "{script}"
+            );
+        }
+        assert!(!cands(&["sh", "-c", "if true; then foot; fi"]).contains(&"then".to_string()));
+        // An unresolvable expansion is not guessed at.
+        assert!(cands(&["sh", "-c", "$BROWSER"]).is_empty());
+    }
+
+    #[test]
+    fn wrappers_are_looked_through() {
+        assert_eq!(cands(&["env", "FOO=1", "google-chrome"]), ["google-chrome"]);
+        assert_eq!(cands(&["sudo", "-n", "foot"]), ["foot"]);
+        assert_eq!(cands(&["nohup", "foot", "&"]), ["foot"]);
+        assert_eq!(cands(&["FOO=1", "foot"]), ["foot"]);
     }
 
     #[test]
@@ -573,7 +728,7 @@ mod script_tests {
 
     #[test]
     fn check_script_quotes_the_command() {
-        let s = gui_check_script("it's weird");
+        let s = gui_check_script(&["it's weird".to_string()]);
         assert!(s.starts_with("sh -c '"));
         // The command must arrive in the script as a single quoted word.
         let out = std::process::Command::new("sh")
@@ -622,7 +777,27 @@ mod script_tests {
 
         // Run the check with HOME pointing at the fake share dir's parent, and
         // the system dirs hidden by rewriting them to the fake location.
-        let script = gui_check_script(&format!("{}/app", bin.display()));
+        let script = gui_check_script(&[format!("{}/app", bin.display())]);
+        let patched = script.replace("/usr/share/applications", &apps.to_string_lossy());
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&patched)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Several candidates are checked in one go: a GUI app later in the list
+        // (`cd x && myapp`) is found even though the first word is not one.
+        let script = gui_check_script(&[
+            "no-such-command".to_string(),
+            "cd".to_string(),
+            format!("{}/app", bin.display()),
+        ]);
         let patched = script.replace("/usr/share/applications", &apps.to_string_lossy());
         let out = std::process::Command::new("sh")
             .arg("-c")
@@ -638,7 +813,7 @@ mod script_tests {
 
         // A program with no launcher is not a GUI app.
         std::fs::write(bin.join("tool"), "#!/bin/sh\n").unwrap();
-        let script = gui_check_script(&format!("{}/tool", bin.display()));
+        let script = gui_check_script(&[format!("{}/tool", bin.display())]);
         let patched = script.replace("/usr/share/applications", &apps.to_string_lossy());
         let out = std::process::Command::new("sh")
             .arg("-c")

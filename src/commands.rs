@@ -480,12 +480,15 @@ pub fn exec(r: &ImageRef, command: &[String], mode: GuiMode) -> Result<i32> {
     // runs for commands that could plausibly be GUI apps.
     let platform = Platform::current()?;
     let gui = Gui::detect(platform, &paths);
+    // What this command would actually run: itself, or what is inside a
+    // `bash -c "..."` or behind `env`/`sudo`.
+    let candidates = gui::gui_candidates(command);
     let use_gui = match (&mode, &gui) {
         (GuiMode::Never, _) => false,
         (GuiMode::Always, Err(e)) => bail!("{e}"),
         (GuiMode::Always, Ok(_)) => true,
         (GuiMode::Auto, Ok(_)) => {
-            gui::worth_checking(command) && ssh.run_quiet(&gui::gui_check_script(&command[0]))? == 0
+            !candidates.is_empty() && ssh.run_quiet(&gui::gui_check_script(&candidates))? == 0
         }
         (GuiMode::Auto, Err(_)) => false,
     };
@@ -501,13 +504,13 @@ pub fn exec(r: &ImageRef, command: &[String], mode: GuiMode) -> Result<i32> {
     if code != 0
         && mode == GuiMode::Auto
         && let Err(reason) = &gui
-        && gui::worth_checking(command)
+        && !candidates.is_empty()
         && ssh
-            .run_quiet(&gui::gui_check_script(&command[0]))
+            .run_quiet(&gui::gui_check_script(&candidates))
             .unwrap_or(1)
             == 0
     {
-        eprintln!("vmmbox: {} is a GUI app, but {reason}", command[0]);
+        eprintln!("vmmbox: this looks like a GUI app, but {reason}");
     }
     Ok(code)
 }
