@@ -1,0 +1,620 @@
+//! Locating QEMU, building its command line, and launching it detached.
+//!
+//! Guests are always hardware-accelerated (KVM / HVF / WHPX) and always the
+//! host's own architecture; there is no TCG fallback.
+
+use crate::cloudinit::HOME_TAG;
+use crate::host::{Accel, Arch, Os, Platform};
+use crate::qmp::Endpoint;
+use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+
+/// Escape a value for QEMU's `key=value,key=value` option syntax,
+/// where a literal comma is written `,,`.
+pub fn escape(s: &str) -> String {
+    s.replace(',', ",,")
+}
+
+fn exe_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
+}
+
+fn find_binary(name: &str, extra_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let file = exe_name(name);
+    let path_dirs = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    path_dirs
+        .iter()
+        .chain(extra_dirs)
+        .map(|d| d.join(&file))
+        .find(|p| p.is_file())
+}
+
+/// Where package managers put QEMU when it isn't on PATH.
+fn well_known_dirs(os: Os) -> Vec<PathBuf> {
+    match os {
+        Os::Mac => ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"]
+            .map(PathBuf::from)
+            .to_vec(),
+        Os::Linux => ["/usr/bin", "/usr/local/bin", "/usr/libexec"]
+            .map(PathBuf::from)
+            .to_vec(),
+        Os::Windows => {
+            let mut dirs = Vec::new();
+            for var in ["ProgramFiles", "ProgramW6432"] {
+                if let Some(p) = std::env::var_os(var) {
+                    dirs.push(PathBuf::from(p).join("qemu"));
+                }
+            }
+            if let Some(p) = std::env::var_os("LOCALAPPDATA") {
+                dirs.push(PathBuf::from(p).join("Programs").join("qemu"));
+            }
+            if let Some(p) = std::env::var_os("USERPROFILE") {
+                dirs.push(PathBuf::from(p).join("scoop/apps/qemu/current"));
+            }
+            dirs
+        }
+    }
+}
+
+fn install_hint(os: Os, arch: Arch) -> String {
+    match os {
+        Os::Mac => "brew install qemu".into(),
+        Os::Linux => match arch {
+            Arch::X86_64 => "install QEMU, e.g. `sudo apt install qemu-system-x86 qemu-utils` \
+                             or `sudo dnf install qemu-system-x86-core qemu-img`"
+                .into(),
+            Arch::Aarch64 => "install qemu-system-aarch64 and qemu-img".into(),
+        },
+        Os::Windows => "winget install SoftwareFreedomConservancy.QEMU".into(),
+    }
+}
+
+pub struct Qemu {
+    pub system: PathBuf,
+    pub img: PathBuf,
+    devices: std::cell::OnceCell<String>,
+}
+
+/// How guest audio reaches the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Audio {
+    /// QEMU `-audiodev` options without the id, e.g. `coreaudio`.
+    pub backend: String,
+    /// virtio-sound if the QEMU build has it, otherwise an Intel HDA codec.
+    pub virtio: bool,
+}
+
+pub struct Firmware {
+    pub code: PathBuf,
+    pub vars_template: PathBuf,
+}
+
+impl Qemu {
+    pub fn locate(platform: Platform) -> Result<Self> {
+        let extra = well_known_dirs(platform.os);
+        let sys_name = format!("qemu-system-{}", platform.arch.as_str());
+        let system = find_binary(&sys_name, &extra).with_context(|| {
+            format!(
+                "{sys_name} not found on PATH. Install QEMU: {}",
+                install_hint(platform.os, platform.arch)
+            )
+        })?;
+        // Prefer the qemu-img shipped next to the system emulator.
+        let img = system
+            .parent()
+            .map(|d| d.join(exe_name("qemu-img")))
+            .filter(|p| p.is_file())
+            .or_else(|| find_binary("qemu-img", &extra))
+            .with_context(|| {
+                format!(
+                    "qemu-img not found. Install QEMU: {}",
+                    install_hint(platform.os, platform.arch)
+                )
+            })?;
+        Ok(Self {
+            system,
+            img,
+            devices: std::cell::OnceCell::new(),
+        })
+    }
+
+    fn run_help(&self, args: &[&str]) -> String {
+        Command::new(&self.system)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| {
+                let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+                s
+            })
+            .unwrap_or_default()
+    }
+
+    /// Ensure this QEMU build can use the host's hardware accelerator.
+    pub fn require_accel(&self, accel: Accel) -> Result<()> {
+        let out = self.run_help(&["-accel", "help"]);
+        if out.lines().any(|l| l.trim() == accel.name()) {
+            Ok(())
+        } else {
+            bail!(
+                "this QEMU build ({}) does not support the {} accelerator",
+                self.system.display(),
+                accel.name().to_uppercase()
+            )
+        }
+    }
+
+    fn has_device(&self, name: &str) -> bool {
+        self.devices
+            .get_or_init(|| self.run_help(&["-device", "help"]))
+            .lines()
+            .any(|l| l.starts_with(&format!("name \"{name}\"")))
+    }
+
+    /// Whether this build can share a host directory with the guest (9p).
+    pub fn supports_9p(&self) -> bool {
+        self.has_device("virtio-9p-pci")
+    }
+
+    /// Pick how to give the guest sound: the host OS's native audio backend
+    /// that this QEMU build includes, with `VMMBOX_AUDIO` as an override
+    /// (`none` disables sound; anything else is raw `-audiodev` options such as
+    /// `wav,path=/tmp/out.wav`).
+    pub fn audio(&self, os: Os) -> Option<Audio> {
+        let backend = match std::env::var("VMMBOX_AUDIO") {
+            Ok(v) if v == "none" => return None,
+            Ok(v) if !v.is_empty() => v,
+            _ => {
+                let available = self.run_help(&["-audiodev", "help"]);
+                let available: Vec<&str> = available.lines().map(str::trim).collect();
+                let preferred: &[&str] = match os {
+                    Os::Mac => &["coreaudio"],
+                    Os::Linux => &["pipewire", "pa", "alsa"],
+                    Os::Windows => &["wasapi", "dsound"],
+                };
+                preferred
+                    .iter()
+                    .find(|b| available.contains(b))?
+                    .to_string()
+            }
+        };
+        let virtio = self.has_device("virtio-sound-pci");
+        if !virtio && !self.has_device("hda-duplex") {
+            return None;
+        }
+        Some(Audio { backend, virtio })
+    }
+
+    /// Directories QEMU searches for firmware and data files.
+    fn data_dirs(&self, os: Os) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self
+            .run_help(&["-L", "help"])
+            .lines()
+            .map(|l| PathBuf::from(l.trim()))
+            .filter(|p| p.is_dir())
+            .collect();
+        if let Some(bin) = self
+            .system
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+        {
+            dirs.push(bin.join("../share/qemu"));
+            dirs.push(bin.join("share")); // Windows installer layout
+        }
+        match os {
+            Os::Mac => dirs
+                .extend(["/opt/homebrew/share/qemu", "/usr/local/share/qemu"].map(PathBuf::from)),
+            Os::Linux => dirs.extend(
+                [
+                    "/usr/share/qemu",
+                    "/usr/share/AAVMF",
+                    "/usr/share/edk2/aarch64",
+                    "/usr/share/qemu-efi-aarch64",
+                ]
+                .map(PathBuf::from),
+            ),
+            Os::Windows => {}
+        }
+        dirs
+    }
+
+    /// UEFI firmware (code image + variable-store template) for aarch64 guests.
+    /// x86_64 guests boot with QEMU's bundled SeaBIOS and need none.
+    pub fn firmware(&self, os: Os) -> Result<Firmware> {
+        const PAIRS: &[(&str, &str)] = &[
+            ("edk2-aarch64-code.fd", "edk2-arm-vars.fd"),
+            ("AAVMF_CODE.fd", "AAVMF_VARS.fd"),
+            ("QEMU_EFI-pflash.raw", "vars-template-pflash.raw"),
+        ];
+        for dir in self.data_dirs(os) {
+            for (code, vars) in PAIRS {
+                let (c, v) = (dir.join(code), dir.join(vars));
+                if c.is_file() && v.is_file() {
+                    return Ok(Firmware {
+                        code: c,
+                        vars_template: v,
+                    });
+                }
+            }
+        }
+        bail!(
+            "UEFI firmware for aarch64 guests (edk2-aarch64-code.fd) was not found; is QEMU fully installed?"
+        )
+    }
+
+    /// Grow a qcow2 image's virtual size. The file itself stays small: qcow2
+    /// only allocates clusters as the guest writes them.
+    pub fn resize(&self, disk: &Path, bytes: u64) -> Result<()> {
+        let out = Command::new(&self.img)
+            .args(["resize", "-f", "qcow2"])
+            .arg(disk)
+            .arg(bytes.to_string())
+            .output()
+            .context("running qemu-img")?;
+        if !out.status.success() {
+            bail!(
+                "qemu-img resize failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Copy a UEFI variable-store template, padding it to the 64 MiB flash size
+/// that the aarch64 `virt` machine requires.
+pub fn prepare_efi_vars(template: &Path, dest: &Path) -> Result<()> {
+    const FLASH_SIZE: u64 = 64 << 20;
+    std::fs::copy(template, dest)
+        .with_context(|| format!("copying {} to {}", template.display(), dest.display()))?;
+    let f = std::fs::OpenOptions::new().write(true).open(dest)?;
+    if f.metadata()?.len() < FLASH_SIZE {
+        f.set_len(FLASH_SIZE)?;
+    }
+    Ok(())
+}
+
+/// Everything needed to describe one VM boot.
+pub struct Launch<'a> {
+    pub name: &'a str,
+    pub platform: Platform,
+    pub cpus: u32,
+    pub memory_mib: u64,
+    pub disk: &'a Path,
+    pub seed: &'a Path,
+    /// (code, vars) pflash images; required for aarch64 guests.
+    pub efi: Option<(&'a Path, &'a Path)>,
+    pub ssh_port: u16,
+    /// Host directory to expose to the guest over 9p.
+    pub share: Option<&'a Path>,
+    pub console_log: &'a Path,
+    pub qmp: &'a Endpoint,
+    pub audio: Option<&'a Audio>,
+}
+
+#[derive(Default)]
+struct Args(Vec<String>);
+
+impl Args {
+    fn flag(&mut self, flag: &str) {
+        self.0.push(flag.to_string());
+    }
+
+    fn kv(&mut self, flag: &str, value: String) {
+        self.0.push(flag.to_string());
+        self.0.push(value);
+    }
+}
+
+/// Build the QEMU argument list.
+pub fn build_args(l: &Launch) -> Result<Vec<String>> {
+    let mut a = Args::default();
+    let path = |p: &Path| escape(&p.to_string_lossy());
+
+    a.kv("-name", format!("vmmbox-{}", l.name));
+
+    let (machine, accel, cpu) = match (l.platform.arch, l.platform.accel()) {
+        (Arch::Aarch64, Accel::Hvf) => ("virt", "hvf", "host"),
+        (Arch::X86_64, Accel::Kvm) => ("q35", "kvm", "host"),
+        (Arch::X86_64, Accel::Hvf) => ("q35", "hvf", "host"),
+        // `host` isn't dependable under WHPX; `max` exposes what it supports.
+        // kernel-irqchip=off avoids known WHPX interrupt-controller issues.
+        (Arch::X86_64, Accel::Whpx) => ("q35", "whpx,kernel-irqchip=off", "max"),
+        (arch, accel) => bail!(
+            "no accelerated machine configuration for {} guests under {}",
+            arch.as_str(),
+            accel.name()
+        ),
+    };
+    a.kv("-machine", machine.to_string());
+    a.kv("-accel", accel.to_string());
+    a.kv("-cpu", cpu.to_string());
+    a.kv("-smp", l.cpus.to_string());
+    a.kv("-m", l.memory_mib.to_string());
+
+    // No default devices: everything the guest sees is listed here.
+    a.flag("-nodefaults");
+    a.kv("-display", "none".into());
+
+    if let Some((code, vars)) = l.efi {
+        a.kv(
+            "-drive",
+            format!(
+                "if=pflash,format=raw,unit=0,readonly=on,file={}",
+                path(code)
+            ),
+        );
+        a.kv(
+            "-drive",
+            format!("if=pflash,format=raw,unit=1,file={}", path(vars)),
+        );
+    }
+
+    a.kv(
+        "-drive",
+        format!(
+            "file={},if=none,id=disk0,format=qcow2,discard=unmap",
+            path(l.disk)
+        ),
+    );
+    a.kv("-device", "virtio-blk-pci,drive=disk0,bootindex=0".into());
+    a.kv(
+        "-drive",
+        format!(
+            "file={},if=none,id=seed0,format=raw,readonly=on",
+            path(l.seed)
+        ),
+    );
+    a.kv("-device", "virtio-blk-pci,drive=seed0".into());
+
+    a.kv(
+        "-netdev",
+        format!("user,id=net0,hostfwd=tcp:127.0.0.1:{}-:22", l.ssh_port),
+    );
+    a.kv("-device", "virtio-net-pci,netdev=net0".into());
+    a.kv("-device", "virtio-rng-pci".into());
+
+    if let Some(dir) = l.share {
+        // security_model=none: the guest sees real host ownership and modes, which
+        // is correct because the guest user has the host user's uid/gid.
+        a.kv(
+            "-fsdev",
+            format!(
+                "local,id=fsdev0,path={},security_model=none,multidevs=remap",
+                path(dir)
+            ),
+        );
+        a.kv(
+            "-device",
+            format!("virtio-9p-pci,fsdev=fsdev0,mount_tag={HOME_TAG}"),
+        );
+    }
+
+    if let Some(audio) = l.audio {
+        a.kv("-audiodev", format!("{},id=snd0", audio.backend));
+        if audio.virtio {
+            a.kv("-device", "virtio-sound-pci,audiodev=snd0".into());
+        } else {
+            a.kv("-device", "intel-hda".into());
+            a.kv("-device", "hda-duplex,audiodev=snd0".into());
+        }
+    }
+
+    a.kv(
+        "-chardev",
+        format!("file,id=console,path={}", path(l.console_log)),
+    );
+    a.kv("-serial", "chardev:console".into());
+
+    a.kv("-chardev", l.qmp.chardev());
+    a.kv("-qmp", "chardev:qmp".into());
+
+    Ok(a.0)
+}
+
+/// Start QEMU detached from this process: it must outlive `vmmbox start`, and
+/// must not die with the terminal. Output goes to `log`.
+pub fn spawn(qemu: &Qemu, args: &[String], log: &Path) -> Result<Child> {
+    let out = std::fs::File::create(log).with_context(|| format!("creating {}", log.display()))?;
+    let err = out.try_clone()?;
+    let mut cmd = Command::new(&qemu.system);
+    cmd.args(args).stdin(Stdio::null()).stdout(out).stderr(err);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and the closure touches no
+        // shared state, as required between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    cmd.spawn()
+        .with_context(|| format!("starting {}", qemu.system.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn launch<'a>(
+        platform: Platform,
+        endpoint: &'a Endpoint,
+        share: Option<&'a Path>,
+    ) -> Launch<'a> {
+        Launch {
+            name: "ubuntu",
+            platform,
+            cpus: 10,
+            memory_mib: 32768,
+            disk: Path::new("/data/vms/ubuntu/disk.qcow2"),
+            seed: Path::new("/data/vms/ubuntu/seed.img"),
+            efi: Some((
+                Path::new("/fw/code.fd"),
+                Path::new("/data/vms/ubuntu/efi-vars.fd"),
+            )),
+            ssh_port: 2222,
+            share,
+            console_log: Path::new("/data/vms/ubuntu/console.log"),
+            qmp: endpoint,
+            audio: None,
+        }
+    }
+
+    fn has_pair(args: &[String], flag: &str, value: &str) -> bool {
+        args.windows(2).any(|w| w[0] == flag && w[1] == value)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_arm_args() {
+        let ep = Endpoint::Unix("/tmp/vmmbox-501/ubuntu.sock".into());
+        let platform = Platform {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        };
+        let args = build_args(&launch(platform, &ep, Some(Path::new("/Users/me")))).unwrap();
+        assert!(has_pair(&args, "-machine", "virt"));
+        assert!(has_pair(&args, "-accel", "hvf"));
+        assert!(has_pair(&args, "-cpu", "host"));
+        assert!(has_pair(&args, "-qmp", "chardev:qmp"));
+        assert!(has_pair(&args, "-smp", "10"));
+        assert!(has_pair(&args, "-m", "32768"));
+        assert!(has_pair(
+            &args,
+            "-netdev",
+            "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22"
+        ));
+        assert!(has_pair(
+            &args,
+            "-fsdev",
+            "local,id=fsdev0,path=/Users/me,security_model=none,multidevs=remap"
+        ));
+        assert!(has_pair(
+            &args,
+            "-device",
+            "virtio-9p-pci,fsdev=fsdev0,mount_tag=vmmhome"
+        ));
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("if=pflash,format=raw,unit=0,readonly=on"))
+        );
+        // Hardware acceleration only: never TCG.
+        assert!(!args.iter().any(|a| a.contains("tcg")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn x86_args_use_accel_and_no_firmware_args_needed() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        };
+        let mut l = launch(platform, &ep, None);
+        l.efi = None;
+        let args = build_args(&l).unwrap();
+        assert!(has_pair(&args, "-machine", "q35"));
+        assert!(has_pair(&args, "-accel", "kvm"));
+        assert!(!args.iter().any(|a| a.contains("pflash")));
+        assert!(!args.iter().any(|a| a.contains("9p")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audio_devices() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        };
+        let virtio = Audio {
+            backend: "coreaudio".into(),
+            virtio: true,
+        };
+        let mut l = launch(platform, &ep, None);
+        l.audio = Some(&virtio);
+        let args = build_args(&l).unwrap();
+        assert!(has_pair(&args, "-audiodev", "coreaudio,id=snd0"));
+        assert!(has_pair(&args, "-device", "virtio-sound-pci,audiodev=snd0"));
+
+        let hda = Audio {
+            backend: "wav,path=/tmp/o.wav".into(),
+            virtio: false,
+        };
+        l.audio = Some(&hda);
+        let args = build_args(&l).unwrap();
+        assert!(has_pair(&args, "-audiodev", "wav,path=/tmp/o.wav,id=snd0"));
+        assert!(has_pair(&args, "-device", "hda-duplex,audiodev=snd0"));
+        assert!(args.iter().any(|a| a == "intel-hda"));
+
+        // No audio configured: no audio devices at all.
+        assert!(
+            !build_args(&launch(platform, &ep, None))
+                .unwrap()
+                .iter()
+                .any(|a| a.contains("audiodev"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn whpx_args() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Windows,
+            arch: Arch::X86_64,
+        };
+        let args = build_args(&launch(platform, &ep, None)).unwrap();
+        assert!(has_pair(&args, "-accel", "whpx,kernel-irqchip=off"));
+        assert!(has_pair(&args, "-cpu", "max"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_combo_is_rejected() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Linux,
+            arch: Arch::Aarch64,
+        };
+        assert!(build_args(&launch(platform, &ep, None)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commas_in_paths_are_escaped() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        };
+        let mut l = launch(platform, &ep, None);
+        l.disk = Path::new("/data/a,b/disk.qcow2");
+        let args = build_args(&l).unwrap();
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("file=/data/a,,b/disk.qcow2,"))
+        );
+    }
+}
