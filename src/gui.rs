@@ -122,9 +122,11 @@ impl Gui {
     /// host compositor, and return its exit status.
     ///
     /// This is what `waypipe ssh` does, done by hand so vmmbox owns the SSH
-    /// process: a one-shot waypipe *client* listens on a private host socket,
-    /// ssh forwards the guest's socket to it, and a waypipe *server* in the
-    /// guest runs the command. The exit status is then plain ssh's. (waypipe's
+    /// process: a waypipe *client* listens on a private host socket, ssh
+    /// forwards the guest's socket to it, and a waypipe *server* in the guest
+    /// runs the command. The client must serve every connection the app opens,
+    /// not just the first: Firefox, for one, probes the display from a helper
+    /// process before its main process connects. The exit status is then plain ssh's. (waypipe's
     /// own ssh mode loses it on macOS: waypipe-darwin reaps its ssh child and
     /// then waits on it a second time.)
     #[cfg(unix)]
@@ -146,7 +148,7 @@ impl Gui {
             .args(["--compress", COMPRESSION])
             .arg("--socket")
             .arg(&host_sock)
-            .args(["--oneshot", "client"])
+            .arg("client")
             .env("XDG_RUNTIME_DIR", &wayland.runtime_dir)
             .env("WAYLAND_DISPLAY", &wayland.display)
             .stdin(Stdio::null())
@@ -187,7 +189,8 @@ impl Gui {
         }
         let result = cmd.arg(ssh.target()).arg(remote).status();
 
-        // The client lingers if the command never opened a Wayland connection.
+        // The client keeps listening for more connections; it ends with the
+        // session.
         let _ = client.kill();
         let _ = client.wait();
         let _ = std::fs::remove_file(&host_sock);
