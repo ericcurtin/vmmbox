@@ -28,7 +28,7 @@ pub fn pull(image: &ImageRef) -> Result<()> {
     let platform = Platform::current()?;
     let paths = Paths::discover()?;
     let version = image.version_or_default();
-    let http = Http::new();
+    let http = Http::new()?;
     match Images::new(&paths).pull(&http, image.distro, &version, platform.arch)? {
         Pulled::Downloaded(m) => println!(
             "Pulled {} ({}, {})",
@@ -177,7 +177,7 @@ pub fn start(r: &ImageRef) -> Result<()> {
             let user = host::current_user()?;
             let version = r.version_or_default();
             let images = Images::new(&paths);
-            let image = images.ensure(&Http::new(), r.distro, &version, platform.arch)?;
+            let image = images.ensure(&Http::new()?, r.distro, &version, platform.arch)?;
             eprintln!("Creating VM '{name}' from {}...", image.reference());
             let base = images.disk_path(&image.distro, &image.version, platform.arch);
             vm::create(&paths, platform, &qemu, &user, &image, &base)?
