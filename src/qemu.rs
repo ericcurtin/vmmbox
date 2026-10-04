@@ -215,7 +215,7 @@ impl Qemu {
     /// Find QEMU: vmmbox's own tools prefix first (where a GPU-enabled build
     /// lives), then PATH, then the usual package-manager locations.
     pub fn locate(platform: Platform, paths: &Paths) -> Result<Self> {
-        let own = [paths.tools_bin()];
+        let own = [paths.bin()];
         let extra = well_known_dirs(platform.os);
         let sys_name = format!("qemu-system-{}", platform.arch.as_str());
         let system = find_binary(&sys_name, &own, &extra).with_context(|| {

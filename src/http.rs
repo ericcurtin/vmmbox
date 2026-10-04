@@ -258,8 +258,6 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
-    use std::net::TcpListener;
 
     #[test]
     fn content_length_of_final_response_only() {
@@ -277,53 +275,9 @@ mod tests {
         assert_eq!(final_content_length(""), None);
     }
 
-    /// Serve `/file`, `/redir` -> `/file`, and 404 for everything else.
+    /// Serve `body` at `/file` (also reachable via `/redir`).
     fn serve(body: Vec<u8>) -> u16 {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let mut reader = BufReader::new(stream);
-                let mut request_line = String::new();
-                if reader.read_line(&mut request_line).is_err() {
-                    continue;
-                }
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
-                        break;
-                    }
-                }
-                let mut parts = request_line.split_whitespace();
-                let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-                let out = reader.get_mut();
-                match path {
-                    "/file" => {
-                        let _ = write!(
-                            out,
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        );
-                        if method != "HEAD" {
-                            let _ = out.write_all(&body);
-                        }
-                    }
-                    "/redir" => {
-                        let _ = write!(
-                            out,
-                            "HTTP/1.1 302 Found\r\nLocation: /file\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                    }
-                    _ => {
-                        let _ = write!(
-                            out,
-                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                    }
-                }
-            }
-        });
-        port
+        crate::testutil::serve(vec![("/file".to_string(), body)])
     }
 
     fn sha256_hex(data: &[u8]) -> String {

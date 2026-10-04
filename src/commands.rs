@@ -1,5 +1,6 @@
 //! Implementations of the `vmmbox` subcommands.
 
+use crate::bundle;
 use crate::distro::{self, ImageRef};
 use crate::gui::{self, Gui};
 use crate::host::{self, Arch, Platform};
@@ -24,6 +25,37 @@ use std::time::{Duration, Instant};
 const BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long to give a guest to power off after an ACPI shutdown request.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `vmmbox setup`: install the QEMU build vmmbox ships for this machine.
+pub fn setup() -> Result<()> {
+    let platform = Platform::current()?;
+    let paths = Paths::discover()?;
+    if bundle::target_for(platform).is_none() {
+        println!(
+            "There is no vmmbox build of QEMU for this machine; the QEMU on your system is used."
+        );
+        return Ok(());
+    }
+    match bundle::ensure(&paths, platform, &Http::new()?)? {
+        bundle::Outcome::Installed => println!("Installed into {}", paths.bin().display()),
+        _ => println!("Already up to date ({})", paths.bin().display()),
+    }
+    Ok(())
+}
+
+/// Install vmmbox's own QEMU if one is published for this machine and ours is
+/// missing or old. This is a convenience, never a requirement: if it fails
+/// the QEMU already on the system is used.
+fn ensure_bundle(paths: &Paths, platform: Platform) {
+    if bundle::target_for(platform).is_none() {
+        return;
+    }
+    if let Err(e) = Http::new().and_then(|http| bundle::ensure(paths, platform, &http)) {
+        eprintln!(
+            "warning: could not install vmmbox's QEMU ({e:#}); using the QEMU on this system"
+        );
+    }
+}
 
 pub fn pull(image: &ImageRef) -> Result<()> {
     let platform = Platform::current()?;
@@ -233,6 +265,7 @@ fn ensure_running(paths: &Paths, platform: Platform, r: &ImageRef) -> Result<(Vm
 
     // Check every prerequisite up front, before downloading gigabytes.
     platform.check_accel()?;
+    ensure_bundle(paths, platform);
     let qemu = Qemu::locate(platform, paths)?;
     qemu.require_accel(platform.accel())?;
     Ssh::require_client()?;

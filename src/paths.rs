@@ -3,7 +3,7 @@
 //! ```text
 //! <root>/images/<distro>/<version>/<arch>/{disk.qcow2,meta.json}
 //! <root>/vms/<distro>/{disk.qcow2,seed.img,vm.json,id_ed25519,...}
-//! <root>/tools/{bin,lib,share}/...   (programs vmmbox installs for itself)
+//! <root>/{bin,lib,share}/...   (vmmbox's own QEMU build, see bundle.rs)
 //! ```
 //!
 //! `<root>` is `$VMMBOX_HOME` if set. Otherwise, on macOS and Linux it follows
@@ -69,14 +69,16 @@ impl Paths {
         self.images().join(distro).join(version).join(arch)
     }
 
-    /// A private install prefix for programs vmmbox builds or installs itself
-    /// (a GPU-enabled QEMU, the GUI compositor): `bin/`, `lib/`, `share/`.
-    pub fn tools(&self) -> PathBuf {
-        self.root.join("tools")
+    /// Where vmmbox keeps the programs it installs for itself (its own QEMU
+    /// build, found before any on `PATH`). `<root>` doubles as the install
+    /// prefix, so QEMU's relocatable lookups find `../lib` and `../share/qemu`.
+    pub fn bin(&self) -> PathBuf {
+        self.root.join("bin")
     }
 
-    pub fn tools_bin(&self) -> PathBuf {
-        self.tools().join("bin")
+    /// Records which QEMU bundle is installed and the files it put in place.
+    pub fn bundle_manifest(&self) -> PathBuf {
+        self.root.join("qemu-bundle.json")
     }
 
     pub fn vms(&self) -> PathBuf {

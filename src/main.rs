@@ -1,6 +1,7 @@
 //! vmmbox: hardware-accelerated Linux distro VMs that mirror your user account
 //! and share your home directory, on top of QEMU.
 
+mod bundle;
 mod checksum;
 mod cloudinit;
 mod commands;
@@ -13,9 +14,12 @@ mod image;
 mod paths;
 mod proc;
 mod qemu;
+mod qemu_pins;
 mod qmp;
 mod resources;
 mod ssh;
+#[cfg(test)]
+mod testutil;
 mod tools;
 mod util;
 mod vm;
@@ -86,6 +90,8 @@ enum Command {
         /// Distro name of the VM
         name: ImageRef,
     },
+    /// Install the QEMU that vmmbox ships, if there is one for this machine
+    Setup,
     /// List the VMs you have created, running or not
     #[command(visible_alias = "list")]
     Ls,
@@ -117,6 +123,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Command::Images => commands::images().map(|()| 0),
         Command::Pull { image } => commands::pull(&image).map(|()| 0),
+        Command::Setup => commands::setup().map(|()| 0),
         Command::Ls => commands::ps(true).map(|()| 0),
         Command::Ps { all } => commands::ps(all).map(|()| 0),
         Command::Rmi { image } => commands::rmi(&image).map(|()| 0),
@@ -149,6 +156,12 @@ mod tests {
     fn the_cli_definition_is_consistent() {
         // Catches duplicate names and aliases.
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn setup_takes_no_arguments() {
+        assert!(matches!(parse(&["setup"]), Command::Setup));
+        assert!(Cli::try_parse_from(["vmmbox", "setup", "extra"]).is_err());
     }
 
     #[test]

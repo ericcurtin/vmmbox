@@ -64,7 +64,7 @@ impl Gui {
     /// Check that this host can show guest windows. The error says what is
     /// missing and how to get it.
     pub fn detect(platform: Platform, paths: &Paths) -> Result<Self> {
-        let own = [paths.tools_bin()];
+        let own = [paths.bin()];
         match platform.os {
             Os::Mac => {
                 let fallback = ["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from);
