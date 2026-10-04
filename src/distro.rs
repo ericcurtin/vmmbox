@@ -15,8 +15,8 @@ pub enum Family {
     Debian,
     Fedora,
     /// Red Hat Enterprise Linux and its rebuilds: AlmaLinux, Rocky Linux and
-    /// CentOS Stream. Their kernels have no 9p, so the host home is shared over
-    /// virtio-fs, which every kernel has (see share.rs).
+    /// CentOS Stream. Their kernels have no 9p, which is why they were once
+    /// dropped; the host home is shared over virtio-fs, which every kernel has.
     Rhel,
 }
 
@@ -128,13 +128,6 @@ impl ImageRef {
 }
 
 impl Family {
-    /// Whether this family's kernels can mount a 9p share. The RHEL family's
-    /// cannot (`CONFIG_NET_9P` is off), so on a host that can only offer 9p
-    /// their VMs get no shared home rather than a mount that can never work.
-    pub fn has_9p(self) -> bool {
-        self != Family::Rhel
-    }
-
     /// Guest packages for sound: PipeWire with its PulseAudio server (what
     /// browsers and most desktop apps speak), WirePlumber as session manager,
     /// and the ALSA bridge for older apps.
@@ -322,8 +315,8 @@ pub fn static_source(family: Family, v: &str, arch: Arch) -> Result<Source> {
                 .find(|(n, _)| *n == v)
                 .map(|(_, s)| *s)
                 .with_context(|| format!("unsupported Debian version '{v}'"))?;
-            // "generic", not "genericcloud": the latter ships the trimmed-down
-            // cloud kernel, which has no 9p support and so can't mount the host home.
+            // "generic", not "genericcloud": the latter ships a trimmed-down
+            // cloud kernel without modules the guest needs (virtio sound).
             simple(
                 &format!("https://cloud.debian.org/images/cloud/{suite}/latest/"),
                 &format!("debian-{v}-generic-{}.qcow2", arch.deb_name()),
@@ -437,14 +430,8 @@ mod tests {
         }
         assert!(
             parse("alma:8").is_err(),
-            "8 has no 9p-free story and no image"
+            "8 is not one of the published versions"
         );
-    }
-
-    #[test]
-    fn only_the_rhel_family_lacks_9p() {
-        assert!(Family::Ubuntu.has_9p() && Family::Debian.has_9p() && Family::Fedora.has_9p());
-        assert!(!Family::Rhel.has_9p());
     }
 
     #[test]

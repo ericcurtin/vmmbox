@@ -5,7 +5,7 @@
 //!
 //! * The guest user gets the host's login name, UID and GID, and its home is
 //!   always `/home/<user>`, so `$HOME` is what a Linux user expects. The host
-//!   home is shared over 9p, so file ownership matches on both sides:
+//!   home is shared over virtio-fs, so file ownership matches on both sides:
 //!   - If the host home is at `/home/<user>` too (typical on Linux) it is
 //!     mounted right there: one direct mount, and that *is* the guest home.
 //!   - Otherwise (`/Users/me` on macOS, `/var/home/me` on Silverblue) it is
@@ -28,7 +28,7 @@
 //!   (non-unique GID).
 
 use crate::host::HostUser;
-use crate::share::{HOME_TAG, Transport};
+use crate::share::{HOME_TAG, fstab_line};
 use crate::util::sh_quote;
 use anyhow::{Context, Result};
 use std::fs::OpenOptions;
@@ -49,8 +49,6 @@ pub struct Seed<'a> {
     pub host_home: &'a str,
     /// Whether the host home is shared into the guest at all.
     pub share_home: bool,
-    /// How it is shared: the file system type the guest's fstab names.
-    pub transport: Transport,
     /// Packages to install on first boot (the audio stack).
     pub packages: &'a [&'a str],
     /// Command that installs sound kernel modules for the running kernel.
@@ -98,7 +96,7 @@ impl Seed<'_> {
             gid = self.user.gid,
         );
         if self.share_home {
-            let fstab_entry = self.transport.fstab_line(&fstab_escape(self.host_home));
+            let fstab_entry = fstab_line(&fstab_escape(self.host_home));
             s.push_str(&format!(
                 "home={host}\n\
                  changed=0\n\
@@ -297,7 +295,6 @@ mod tests {
             guest_home: "/home/ecurtin",
             host_home,
             share_home: share,
-            transport: Transport::NineP,
             packages: &["pipewire", "wireplumber"],
             kernel_modules_cmd: Some("apt-get install -y \"linux-modules-extra-$(uname -r)\""),
         }
@@ -305,23 +302,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_virtiofs_share_is_mounted_as_virtiofs_and_nothing_else_changes() {
+    fn the_share_is_mounted_as_virtiofs() {
         let u = user();
-        let mut s = seed(&u, true);
-        s.transport = Transport::VirtioFs;
-        let ud = s.user_data();
+        let ud = seed(&u, true).user_data();
         assert!(
             ud.contains("vmmhome /Users/ecurtin virtiofs defaults,nofail 0 0"),
             "{ud}"
         );
-        assert!(!ud.contains(" 9p "), "no 9p entry for a virtio-fs VM");
-        // The same VM with 9p differs only in that line.
-        let nine = seed(&u, true).user_data();
-        assert!(
-            nine.contains("vmmhome /Users/ecurtin 9p trans=virtio"),
-            "{nine}"
-        );
-        assert!(!nine.contains("virtiofs"));
+        assert!(!ud.contains(" 9p "), "9p is no longer offered");
     }
 
     #[test]
@@ -414,10 +402,10 @@ mod tests {
     #[test]
     fn host_home_elsewhere_is_one_mount_at_its_own_path() {
         let (fstab, log) = run_boot_script("/Users/ecurtin", "diff");
-        // Exactly the 9p share at the host path, written once though the script
+        // Exactly the share at the host path, written once though the script
         // ran twice, with existing entries kept and nothing else added.
         assert_eq!(
-            count(&fstab, "vmmhome /Users/ecurtin 9p trans=virtio"),
+            count(&fstab, "vmmhome /Users/ecurtin virtiofs defaults,nofail"),
             1,
             "{fstab}"
         );
@@ -445,7 +433,11 @@ mod tests {
     #[test]
     fn host_home_at_home_user_is_a_single_direct_mount() {
         let (fstab, log) = run_boot_script("/home/ecurtin", "same");
-        assert_eq!(count(&fstab, "vmmhome /home/ecurtin 9p"), 1, "{fstab}");
+        assert_eq!(
+            count(&fstab, "vmmhome /home/ecurtin virtiofs"),
+            1,
+            "{fstab}"
+        );
         assert!(
             !fstab.contains("bind"),
             "no bind mount onto itself: {fstab}"
@@ -459,7 +451,7 @@ mod tests {
     fn paths_with_spaces_are_escaped_in_fstab_but_not_in_commands() {
         let (fstab, log) = run_boot_script("/Users/John Smith", "space");
         assert!(
-            fstab.contains("vmmhome /Users/John\\040Smith 9p "),
+            fstab.contains("vmmhome /Users/John\\040Smith virtiofs "),
             "{fstab}"
         );
         // mount(8) takes the real path and decodes the fstab itself.
@@ -475,7 +467,7 @@ mod tests {
         let u = user();
         let ud = seed(&u, false).user_data();
         assert!(!ud.contains("homedir"));
-        assert!(!ud.contains("9p"));
+        assert!(!ud.contains("virtiofs"));
         assert!(!ud.contains("no_create_home"));
         assert!(ud.contains("groupadd"));
     }

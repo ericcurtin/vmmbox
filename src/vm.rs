@@ -11,7 +11,7 @@ use crate::image::ImageMeta;
 use crate::paths::Paths;
 use crate::qemu::{self, Qemu};
 use crate::resources;
-use crate::share::{self, Transport};
+use crate::share::Transport;
 use crate::ssh;
 use crate::util::now_secs;
 use anyhow::{Context, Result};
@@ -37,8 +37,8 @@ pub struct VmState {
     /// match; otherwise `guest_home` is a plain directory on the VM's disk.
     pub host_home: String,
     pub home_shared: bool,
-    /// How the host home is shared (the guest's fstab names it). Records from
-    /// before virtio-fs have none, and used 9p.
+    /// What the guest's fstab mounts the shared home with. Records from before
+    /// virtio-fs have none, and mean 9p: such a VM is switched at its next start.
     #[serde(default)]
     pub home_transport: Transport,
     /// The virtio-fs server's pid while it runs.
@@ -212,42 +212,28 @@ fn build(
         .map(|d| d.family)
         .with_context(|| format!("unknown distro '{}'", image.distro))?;
 
-    // Share the host home only where QEMU can, and warn rather than fail where
-    // it can't: the VM is still useful without it.
-    let transport = if platform.supports_home_share() {
-        let support = share::Support {
-            // The guest kernel must have 9p as well as the host QEMU.
-            ninep: qemu.supports_9p() && family.has_9p(),
-            virtiofs: qemu.supports_virtiofs(platform.os) && fsd::available(platform),
-        };
-        let forced = std::env::var("VMMBOX_SHARE").ok();
-        let chosen = share::choose(platform.os, support, forced.as_deref());
-        if chosen.is_none() {
-            eprintln!(
-                "warning: this QEMU build cannot share the host home directory{}; the VM will \
-                 have its own /home/{}",
-                if forced.is_some() {
-                    " the way VMMBOX_SHARE asks"
-                } else if !family.has_9p() {
-                    " (this guest's kernel has no 9p, and virtio-fs is not available here: \
-                     see `vmmbox start` on a machine that has it)"
-                } else {
-                    " (no virtio-9p or virtio-fs)"
-                },
-                user.name
-            );
-        }
-        chosen
-    } else {
+    // Share the host home over virtio-fs where this machine can serve it, and
+    // warn rather than fail where it can't: the VM is still useful without it.
+    let home_shared = if !platform.supports_home_share() {
         eprintln!(
-            "warning: sharing the host home directory is not supported on {} (QEMU has no \
-             9p/virtiofs there); the VM will have its own /home/{}",
+            "warning: sharing the host home directory is not supported on {}; the VM will \
+             have its own /home/{}",
             platform.os.name(),
             user.name
         );
-        None
+        false
+    } else if !qemu.supports_virtiofs(platform.os) || !fsd::available(platform) {
+        eprintln!(
+            "warning: this machine cannot share the host home directory with {} ({}); the VM \
+             will have its own /home/{}",
+            qemu.system.display(),
+            fsd::install_hint(platform.os),
+            user.name
+        );
+        false
+    } else {
+        true
     };
-    let home_shared = transport.is_some();
     // The account's home is /home/<user>, whatever the host's layout. The host
     // home is shared at its own host path, and is the guest home only when that
     // path is the same (see cloudinit.rs).
@@ -281,7 +267,6 @@ fn build(
         guest_home: &guest_home,
         host_home: &host_home,
         share_home: home_shared,
-        transport: transport.unwrap_or_default(),
         packages: &packages,
         kernel_modules_cmd: family.kernel_modules_cmd(),
     }
@@ -300,7 +285,9 @@ fn build(
         guest_home,
         host_home,
         home_shared,
-        home_transport: transport.unwrap_or_default(),
+        // New VMs always mount with virtio-fs, shared or not; only older ones
+        // have anything to switch.
+        home_transport: Transport::VirtioFs,
         fsd_pid: None,
         pid: None,
         ssh_port: 0,

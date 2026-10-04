@@ -45,10 +45,10 @@ esac
 ok "accelerator $accel"
 
 devices="$("$qemu" -device help 2>&1)"
-for d in virtio-9p-pci vhost-user-fs-pci virtio-sound-pci virtio-blk-pci virtio-net-pci virtio-rng-pci; do
+for d in vhost-user-fs-pci virtio-sound-pci virtio-blk-pci virtio-net-pci virtio-rng-pci; do
 	printf '%s\n' "$devices" | grep -q "name \"$d\"" || die "missing device $d"
 done
-ok "devices: 9p, virtio-fs, sound, blk, net, rng"
+ok "devices: virtio-fs, sound, blk, net, rng"
 
 # virtio-fs shares guest RAM with the file server, which on macOS needs the
 # POSIX-shm memory backend (there is no memfd).

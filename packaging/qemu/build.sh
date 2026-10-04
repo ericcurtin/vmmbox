@@ -113,7 +113,7 @@ fi
 		--prefix="$STAGE" \
 		--target-list="$SYSTEM_TARGET" \
 		--without-default-features \
-		--enable-slirp --enable-virtfs --enable-tools --enable-zstd --enable-pixman \
+		--enable-slirp --enable-tools --enable-zstd --enable-pixman \
 		--enable-fdt=internal \
 		"${CONFIGURE_FLAGS[@]}"
 	step "Building"

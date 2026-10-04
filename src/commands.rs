@@ -8,10 +8,10 @@ use crate::host::{self, Arch, Platform};
 use crate::http::Http;
 use crate::image::{Images, Pulled};
 use crate::paths::Paths;
-use crate::qemu::{self, Gpu, HomeShare, Launch, Qemu};
+use crate::qemu::{self, Gpu, Launch, Qemu};
 use crate::qmp::Endpoint;
 use crate::resources;
-use crate::share::Transport;
+use crate::share::{self, Transport};
 use crate::ssh::Ssh;
 use crate::util::{
     dir_size, format_ago, format_bytes, format_duration, now_secs, sh_quote, table, tail_lines,
@@ -314,7 +314,7 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
     let vfs_socket: PathBuf;
     let share = if !vm.state.home_shared {
         None
-    } else if vm.state.home_transport == Transport::VirtioFs {
+    } else {
         if !qemu.supports_virtiofs(platform.os) || !fsd::available(platform) {
             bail!(
                 "{name} shares your home over virtio-fs, which this machine cannot serve \
@@ -327,11 +327,7 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
         fsd.started = Some((pid, socket.clone()));
         vm.state.fsd_pid = Some(pid);
         vfs_socket = socket;
-        Some(HomeShare::VirtioFs {
-            socket: &vfs_socket,
-        })
-    } else {
-        Some(HomeShare::NineP { dir: &host_home })
+        Some(vfs_socket.as_path())
     };
     let audio = qemu.audio(platform.os);
     let mut gpu = qemu.gpu(platform.os);
@@ -435,12 +431,19 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
     let _ = ssh.run_quiet("sudo -n timeout 300 cloud-init status --wait");
     vm.state.booted_before = true;
     vm.save()?;
+    // A VM made when 9p was offered has a 9p line in its fstab: it was just
+    // started with a virtio-fs device instead, so switch the line over.
+    if needs_home_migration(&vm.state)
+        && let Err(e) = migrate_home(vm, &ssh)
+    {
+        eprintln!("warning: could not switch the shared home to virtio-fs: {e:#}");
+    }
     if let Some(path) = vm.state.shared_home_path() {
         let probe = format!("mountpoint -q {}", sh_quote(path));
         if ssh.run_quiet(&probe)? != 0 {
             eprintln!(
                 "warning: the host home is not mounted at {path} in the guest; the guest kernel \
-                 may lack 9p support (see {})",
+                 may lack virtio-fs support (see {})",
                 vm.console_log().display()
             );
         }
@@ -451,6 +454,31 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
         elapsed: started.elapsed(),
         gpu,
     })
+}
+
+/// Whether the guest still mounts the shared home with 9p, which vmmbox no
+/// longer offers: its VM was made before virtio-fs.
+fn needs_home_migration(state: &vm::VmState) -> bool {
+    state.home_shared && state.home_transport == Transport::NineP
+}
+
+/// Switch a running guest's fstab entry for the shared home from 9p to virtio-fs,
+/// and mount it. Once it has worked, the VM is recorded as switched.
+fn migrate_home(vm: &mut Vm, ssh: &Ssh) -> Result<()> {
+    let Some(mount_point) = vm.state.shared_home_path() else {
+        return Ok(());
+    };
+    eprintln!(
+        "Switching {}'s shared home from 9p to virtio-fs (once)...",
+        vm.state.name
+    );
+    let script = share::migration_script(mount_point);
+    let code = ssh.run_quiet(&format!("sudo -n sh -c {}", sh_quote(&script)))?;
+    if code != 0 {
+        bail!("the guest could not mount the share with virtio-fs (exit status {code})");
+    }
+    vm.state.home_transport = Transport::VirtioFs;
+    vm.save()
 }
 
 fn print_summary(paths: &Paths, platform: Platform, vm: &Vm, booted: &Booted) {
@@ -471,16 +499,13 @@ fn print_summary(paths: &Paths, platform: Platform, vm: &Vm, booted: &Booted) {
     println!("  User:   {} (uid {}, gid {})", s.user, s.uid, s.gid);
     if s.home_shared && s.guest_home == s.host_home {
         println!(
-            "  Home:   {} (shared with the host over {})",
-            s.guest_home,
-            s.home_transport.name()
+            "  Home:   {} (shared with the host over virtio-fs)",
+            s.guest_home
         );
     } else if s.home_shared {
         println!(
-            "  Home:   {} (on the VM); your host home is mounted at {} over {}",
-            s.guest_home,
-            s.host_home,
-            s.home_transport.name()
+            "  Home:   {} (on the VM); your host home is mounted at {} over virtio-fs",
+            s.guest_home, s.host_home
         );
     } else {
         println!("  Home:   {}", s.guest_home);
@@ -809,7 +834,7 @@ mod tests {
             guest_home: "/home/me".into(),
             host_home: "/Users/me".into(),
             home_shared: true,
-            home_transport: Transport::NineP,
+            home_transport: Transport::VirtioFs,
             fsd_pid: None,
             booted_before: true,
             pid,
@@ -854,6 +879,23 @@ mod tests {
         vm.state.ssh_port = free_port().unwrap();
         vm.state.started_at = Some(now_secs() - started_secs_ago);
         vm
+    }
+
+    #[test]
+    fn only_a_shared_vm_from_the_9p_days_needs_its_home_switched() {
+        let (paths, root) = scratch("migrate");
+        fake_vm(&paths, "ubuntu", "26.04", 10, None);
+        let mut vm = vm::load(&paths, "ubuntu").unwrap().unwrap();
+        assert!(
+            !needs_home_migration(&vm.state),
+            "a new VM is already virtio-fs"
+        );
+        vm.state.home_transport = Transport::NineP;
+        assert!(needs_home_migration(&vm.state));
+        // No share, nothing to switch.
+        vm.state.home_shared = false;
+        assert!(!needs_home_migration(&vm.state));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -102,7 +102,7 @@ impl Platform {
     }
 
     /// Whether QEMU can share a host directory with the guest on this OS.
-    /// QEMU's 9p (virtfs) backend only exists for Linux and macOS hosts.
+    /// Only Linux and macOS have a virtio-fs server (see fsd.rs).
     pub fn supports_home_share(self) -> bool {
         matches!(self.os, Os::Linux | Os::Mac)
     }

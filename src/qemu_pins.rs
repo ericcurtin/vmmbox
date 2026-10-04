@@ -13,6 +13,7 @@ pub const MIN_MACOS: u32 = 15;
 
 /// SHA-256 of each published archive, by target. A target with no entry has no
 /// bundle, and vmmbox uses the QEMU it finds on the system instead.
-pub const PINS: &[(&str, &str)] = &[
-    ("aarch64-apple-darwin", "387e4c89bbf12a562d189c4eae8f69679be9ba9e71e35e562a4782054f85de3f"),
-];
+pub const PINS: &[(&str, &str)] = &[(
+    "aarch64-apple-darwin",
+    "387e4c89bbf12a562d189c4eae8f69679be9ba9e71e35e562a4782054f85de3f",
+)];
