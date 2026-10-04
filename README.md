@@ -12,7 +12,7 @@ scoop install vmmbox
 vmmbox pull ubuntu        # or ubuntu:24.04, fedora:44
 vmmbox start ubuntu
 vmmbox exec ubuntu bash
-vmmbox ps                 # also: images, stop, rm
+vmmbox ps                 # also: images, stop, rm, rmi
 ```
 
 GPL-2.0, see [LICENSE](LICENSE).

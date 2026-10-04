@@ -5,7 +5,7 @@ use crate::distro::Distro;
 use crate::host::Arch;
 use crate::http::Http;
 use crate::paths::Paths;
-use crate::util::{format_bytes, now_secs};
+use crate::util::{dir_size, format_bytes, now_secs};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -142,6 +142,36 @@ impl<'a> Images<'a> {
                 Err(e)
             }
         }
+    }
+
+    /// Delete the pulled image and return the bytes freed, or `None` if there
+    /// is no such image. Virtual machines are unaffected: each has its own copy
+    /// of the disk.
+    ///
+    /// A partly downloaded image is removed too. Every directory on the way
+    /// down from the store must be a real one, so that a symlink cannot lead
+    /// the delete somewhere else.
+    pub fn remove(&self, distro: &str, version: &str, arch: Arch) -> Result<Option<u64>> {
+        let mut dir = self.paths.images();
+        for part in [distro, version, arch.as_str()] {
+            dir.push(part);
+            match std::fs::symlink_metadata(&dir) {
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => bail!("refusing to remove {}: not a directory", dir.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+            }
+        }
+        let size = dir_size(&dir);
+        std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+        // Tidy up the version and distro directories once nothing is left in
+        // them; `remove_dir` leaves them alone if something is.
+        for _ in 0..2 {
+            if !dir.pop() || std::fs::remove_dir(&dir).is_err() {
+                break;
+            }
+        }
+        Ok(Some(size))
     }
 
     /// The local image, pulling it first if it is not present.

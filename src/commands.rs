@@ -11,7 +11,7 @@ use crate::qmp::Endpoint;
 use crate::resources;
 use crate::ssh::Ssh;
 use crate::util::{
-    format_ago, format_bytes, format_duration, now_secs, sh_quote, table, tail_lines,
+    dir_size, format_ago, format_bytes, format_duration, now_secs, sh_quote, table, tail_lines,
 };
 use crate::vm::{self, Vm};
 use anyhow::{Context, Result, bail};
@@ -68,6 +68,47 @@ pub fn images() -> Result<()> {
     }
     print!("{}", table(&rows));
     Ok(())
+}
+
+pub fn rmi(r: &ImageRef) -> Result<()> {
+    let platform = Platform::current()?;
+    let paths = Paths::discover()?;
+    let freed = remove_image(&paths, r, platform.arch)?;
+    println!(
+        "{}:{} removed ({} freed)",
+        r.distro.name,
+        r.version_or_default(),
+        format_bytes(freed)
+    );
+    Ok(())
+}
+
+/// Delete a pulled image, returning the bytes freed. VMs made from it keep
+/// working: each has its own copy of the disk.
+fn remove_image(paths: &Paths, r: &ImageRef, arch: Arch) -> Result<u64> {
+    let images = Images::new(paths);
+    let version = r.version_or_default();
+    match images.remove(r.distro.name, &version, arch)? {
+        Some(freed) => Ok(freed),
+        None => {
+            let name = r.distro.name;
+            let others: Vec<String> = images
+                .list()?
+                .into_iter()
+                .filter(|m| m.distro == name && m.arch == arch.as_str())
+                .map(|m| m.version)
+                .collect();
+            if others.is_empty() {
+                bail!("no image {name}:{version}; see `vmmbox images`")
+            }
+            bail!(
+                "no image {name}:{version} (pulled: {}); name the version to remove, \
+                 e.g. `vmmbox rmi {name}:{}`",
+                others.join(", "),
+                others[0]
+            )
+        }
+    }
 }
 
 pub fn ps(all: bool) -> Result<()> {
@@ -470,20 +511,6 @@ fn delete_vm_dir(paths: &Paths, dir: &std::path::Path) -> Result<u64> {
     Ok(size)
 }
 
-/// Total size of the regular files under `dir`, not following symlinks.
-fn dir_size(dir: &std::path::Path) -> u64 {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    rd.flatten()
-        .map(|e| match e.file_type() {
-            Ok(t) if t.is_dir() => dir_size(&e.path()),
-            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
-            _ => 0,
-        })
-        .sum()
-}
-
 /// Whether `exec` forwards windows for a command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuiMode {
@@ -629,6 +656,138 @@ mod tests {
 
     fn rref(s: &str) -> ImageRef {
         s.parse().unwrap()
+    }
+
+    /// A pulled image on disk: a record plus a disk file of `size` bytes.
+    fn fake_image(paths: &Paths, distro: &str, version: &str, size: usize) -> PathBuf {
+        let dir = paths.image_dir(distro, version, "aarch64");
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = crate::image::ImageMeta {
+            distro: distro.into(),
+            version: version.into(),
+            arch: "aarch64".into(),
+            file_name: "disk.img".into(),
+            url: "https://example.invalid/disk.img".into(),
+            algo: crate::checksum::Algo::Sha256,
+            sha: "0".repeat(64),
+            size: size as u64,
+            pulled_at: 1,
+        };
+        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        std::fs::write(dir.join("disk.qcow2"), vec![0u8; size]).unwrap();
+        dir
+    }
+
+    #[test]
+    fn rmi_deletes_the_image_and_reports_the_space() {
+        let (paths, root) = scratch("rmi-ok");
+        let image = fake_image(&paths, "ubuntu", "24.04", 7000);
+        let other_version = fake_image(&paths, "ubuntu", "26.04", 10);
+        let other_distro = fake_image(&paths, "debian", "13", 10);
+        // A VM made from the image has its own copy of the disk.
+        let vm = fake_vm(&paths, "ubuntu", "24.04", 20, None);
+
+        let freed = remove_image(&paths, &rref("ubuntu:24.04"), Arch::Aarch64).unwrap();
+        assert!(freed >= 7000, "freed {freed}");
+        assert!(!image.exists());
+        assert!(other_version.join("disk.qcow2").exists());
+        assert!(other_distro.join("disk.qcow2").exists());
+        assert!(vm.join("disk.qcow2").exists(), "VMs are untouched");
+        // The version directory went with it; the distro's other version stays.
+        assert!(!paths.images().join("ubuntu/24.04").exists());
+        assert!(paths.images().join("ubuntu/26.04").is_dir());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rmi_prunes_directories_left_empty_but_not_others() {
+        let (paths, root) = scratch("rmi-prune");
+        fake_image(&paths, "debian", "13", 10);
+        remove_image(&paths, &rref("debian"), Arch::Aarch64).unwrap();
+        assert!(!paths.images().join("debian").exists());
+        assert!(paths.images().is_dir(), "the store itself stays");
+        assert!(Images::new(&paths).list().unwrap().is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rmi_without_a_version_means_the_default_one() {
+        let (paths, root) = scratch("rmi-default");
+        let default = rref("ubuntu").version_or_default();
+        let other = if default == "24.04" { "26.04" } else { "24.04" };
+        let image = fake_image(&paths, "ubuntu", &default, 10);
+        let kept = fake_image(&paths, "ubuntu", other, 10);
+        remove_image(&paths, &rref("ubuntu"), Arch::Aarch64).unwrap();
+        assert!(!image.exists());
+        assert!(kept.join("disk.qcow2").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rmi_of_an_image_that_is_not_there_says_what_is() {
+        let (paths, root) = scratch("rmi-missing");
+        let err = remove_image(&paths, &rref("fedora:44"), Arch::Aarch64)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no image fedora:44") && err.contains("vmmbox images"),
+            "{err}"
+        );
+
+        fake_image(&paths, "fedora", "43", 10);
+        let err = remove_image(&paths, &rref("fedora:44"), Arch::Aarch64)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no image fedora:44")
+                && err.contains("pulled: 43")
+                && err.contains("rmi fedora:43"),
+            "{err}"
+        );
+        assert!(paths.image_dir("fedora", "43", "aarch64").is_dir());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rmi_removes_a_partial_download() {
+        let (paths, root) = scratch("rmi-partial");
+        let dir = paths.image_dir("ubuntu", "24.04", "aarch64");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("disk.qcow2.part"), vec![0u8; 3000]).unwrap();
+        let freed = remove_image(&paths, &rref("ubuntu:24.04"), Arch::Aarch64).unwrap();
+        assert!(freed >= 3000, "freed {freed}");
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rmi_never_follows_a_symlink_out_of_the_store() {
+        let (paths, root) = scratch("rmi-symlink");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("24.04/aarch64")).unwrap();
+        std::fs::write(elsewhere.join("24.04/aarch64/precious.txt"), b"keep me").unwrap();
+        std::fs::create_dir_all(paths.images()).unwrap();
+
+        // The distro directory is a symlink...
+        std::os::unix::fs::symlink(&elsewhere, paths.images().join("ubuntu")).unwrap();
+        let err = remove_image(&paths, &rref("ubuntu:24.04"), Arch::Aarch64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing"), "{err}");
+        assert!(elsewhere.join("24.04/aarch64/precious.txt").exists());
+        std::fs::remove_file(paths.images().join("ubuntu")).unwrap();
+
+        // ...and so is the image directory itself.
+        std::fs::create_dir_all(paths.images().join("debian/13")).unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.join("24.04/aarch64"),
+            paths.images().join("debian/13/aarch64"),
+        )
+        .unwrap();
+        assert!(remove_image(&paths, &rref("debian:13"), Arch::Aarch64).is_err());
+        assert!(elsewhere.join("24.04/aarch64/precious.txt").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

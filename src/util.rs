@@ -9,6 +9,20 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Total size of the regular files under `dir`, not following symlinks.
+pub fn dir_size(dir: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// Format a byte count using binary units: `32 GiB`, `901.7 MiB`.
 pub fn format_bytes(n: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
