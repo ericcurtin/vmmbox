@@ -22,6 +22,8 @@ mod ssh;
 mod testutil;
 mod tools;
 mod util;
+#[cfg(target_os = "macos")]
+mod virtiofs;
 mod vm;
 
 use clap::{Parser, Subcommand};
@@ -92,6 +94,20 @@ enum Command {
     },
     /// Install the QEMU that vmmbox ships, if there is one for this machine
     Setup,
+    /// Serve a directory to a VM over virtio-fs (started by vmmbox itself)
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    Virtiofsd {
+        /// vhost-user socket QEMU connects to
+        #[arg(long)]
+        socket: std::path::PathBuf,
+        /// Directory to share
+        #[arg(long)]
+        root: std::path::PathBuf,
+        /// Log what the server does
+        #[arg(long)]
+        debug: bool,
+    },
     /// List the VMs you have created, running or not
     #[command(visible_alias = "list")]
     Ls,
@@ -124,6 +140,12 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Images => commands::images().map(|()| 0),
         Command::Pull { image } => commands::pull(&image).map(|()| 0),
         Command::Setup => commands::setup().map(|()| 0),
+        #[cfg(target_os = "macos")]
+        Command::Virtiofsd {
+            socket,
+            root,
+            debug,
+        } => virtiofs::serve(&socket, &root, debug).map(|()| 0),
         Command::Ls => commands::ps(true).map(|()| 0),
         Command::Ps { all } => commands::ps(all).map(|()| 0),
         Command::Rmi { image } => commands::rmi(&image).map(|()| 0),

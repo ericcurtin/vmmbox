@@ -479,8 +479,8 @@ mod tests {
     #[test]
     fn urls_and_names() {
         assert_eq!(
-            archive_name("aarch64-apple-darwin", "11.1.2", 1),
-            "vmmbox-qemu-11.1.2-r1-aarch64-apple-darwin.tar.gz"
+            archive_name("aarch64-apple-darwin", "11.0.5", 1),
+            "vmmbox-qemu-11.0.5-r1-aarch64-apple-darwin.tar.gz"
         );
         let u = archive_url("aarch64-apple-darwin");
         assert!(

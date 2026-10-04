@@ -5,7 +5,7 @@
 //! make a downloaded bundle trustworthy.
 
 /// Upstream QEMU version in the bundle.
-pub const VERSION: &str = "11.1.2";
+pub const VERSION: &str = "11.0.5";
 /// Bundle revision: bumped when only the build recipe changes.
 pub const REV: u32 = 1;
 
