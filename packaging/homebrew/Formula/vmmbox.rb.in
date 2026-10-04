@@ -44,7 +44,7 @@ class Vmmbox < Formula
   def caveats
     gui = if OS.mac?
       <<~EOS
-        GUI apps (vmmbox exec ubuntu google-chrome) open as windows on your desktop
+        GUI apps (vmmbox run ubuntu google-chrome) open as windows on your desktop
         once a Wayland compositor and waypipe are installed. They come from a
         third-party tap, so Homebrew needs you to ask for them explicitly:
 
@@ -64,7 +64,7 @@ class Vmmbox < Formula
       Start a VM and get a shell in it:
 
         vmmbox start ubuntu
-        vmmbox exec ubuntu bash
+        vmmbox run ubuntu bash
 
       #{gui}
     EOS

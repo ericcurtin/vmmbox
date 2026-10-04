@@ -558,7 +558,7 @@ mod script_tests {
 
     #[test]
     fn a_shell_c_script_is_judged_by_what_it_runs() {
-        // The reported bug: `vmmbox exec fedora bash -c google-chrome`.
+        // The reported bug: `vmmbox run fedora bash -c google-chrome`.
         assert_eq!(cands(&["bash", "-c", "google-chrome"]), ["google-chrome"]);
         assert_eq!(cands(&["sh", "-c", "foot"]), ["foot"]);
         assert_eq!(

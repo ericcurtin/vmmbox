@@ -9,7 +9,7 @@ scoop install vmmbox
 ```
 
 ```
-vmmbox exec ubuntu bash   # pulls, creates and starts the VM as needed
+vmmbox run ubuntu bash    # pulls, creates and starts the VM as needed
                           # (or ubuntu:24.04, fedora:44)
 vmmbox ls                 # also: ps, images, pull, start, stop, rm, rmi
 ```

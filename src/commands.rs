@@ -216,7 +216,7 @@ struct Booted {
 /// Make sure the VM for `r` is running: pull its image, create the VM and boot
 /// it, whichever of those is still to do. The boot report is `None` if it was
 /// already running. Everything this prints goes to stderr, so a command run
-/// through `exec` keeps its stdout to itself.
+/// through `run` keeps its stdout to itself.
 fn ensure_running(paths: &Paths, platform: Platform, r: &ImageRef) -> Result<(Vm, Option<Booted>)> {
     let name = r.distro.name;
 
@@ -427,7 +427,7 @@ fn print_summary(paths: &Paths, platform: Platform, vm: &Vm, booted: &Booted) {
         Ok(_) => println!("  GUI:    ready (windows open on your desktop)"),
         Err(e) => println!("  GUI:    unavailable: {e}"),
     }
-    println!("Run `vmmbox exec {name} bash` for a shell.");
+    println!("Run `vmmbox run {name} bash` for a shell.");
 }
 
 fn wait_exit(pid: u32, timeout: Duration) -> bool {
@@ -546,7 +546,7 @@ fn delete_vm_dir(paths: &Paths, dir: &std::path::Path) -> Result<u64> {
     Ok(size)
 }
 
-/// Whether `exec` forwards windows for a command.
+/// Whether `run` forwards windows for a command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuiMode {
     /// Forward windows when the command is a GUI application.
@@ -557,7 +557,7 @@ pub enum GuiMode {
     Never,
 }
 
-pub fn exec(r: &ImageRef, command: &[String], mode: GuiMode) -> Result<i32> {
+pub fn run(r: &ImageRef, command: &[String], mode: GuiMode) -> Result<i32> {
     let paths = Paths::discover()?;
     let platform = Platform::current()?;
     // The VM is pulled, created and started first if that is still to do.
@@ -755,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_does_not_probe_a_vm_that_has_been_up_a_while() {
+    fn run_does_not_probe_a_vm_that_has_been_up_a_while() {
         let (paths, root) = scratch("await-old");
         let vm = closed_port_vm(&paths, 10_000);
         let Ok(ssh) = Ssh::for_vm(&vm) else { return };
@@ -767,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_waits_for_a_vm_that_is_still_booting_then_gives_up() {
+    fn run_waits_for_a_vm_that_is_still_booting_then_gives_up() {
         let (paths, root) = scratch("await-new");
         let vm = closed_port_vm(&paths, 1);
         let Ok(ssh) = Ssh::for_vm(&vm) else { return };

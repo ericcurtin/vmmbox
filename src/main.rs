@@ -46,9 +46,11 @@ enum Command {
     /// Run a command in a VM as your user, in your current directory. The VM is
     /// pulled, created and started first if need be. GUI apps (e.g.
     /// google-chrome) open as windows on your desktop.
-    Exec {
+    // `exec` was this command's name in 0.1.x; it keeps working, unlisted.
+    #[command(alias = "exec")]
+    Run {
         /// Open as a GUI app even if vmmbox doesn't recognise the command as one
-        /// (needed to start GUI apps from a shell: `exec --gui ubuntu bash`)
+        /// (needed to start GUI apps from a shell: `run --gui ubuntu bash`)
         #[arg(long)]
         gui: bool,
         /// Never forward windows; run as a plain terminal command
@@ -95,7 +97,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     match cli.command {
         Command::Start { image } => commands::start(&image).map(|()| 0),
         Command::Stop { name } => commands::stop(&name).map(|()| 0),
-        Command::Exec {
+        Command::Run {
             gui,
             no_gui,
             name,
@@ -106,7 +108,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 (_, true) => commands::GuiMode::Never,
                 _ => commands::GuiMode::Auto,
             };
-            commands::exec(&name, &command, mode)
+            commands::run(&name, &command, mode)
         }
         Command::Images => commands::images().map(|()| 0),
         Command::Pull { image } => commands::pull(&image).map(|()| 0),
@@ -148,6 +150,37 @@ mod tests {
     fn ls_and_list_both_list_created_vms() {
         assert!(matches!(parse(&["ls"]), Command::Ls));
         assert!(matches!(parse(&["list"]), Command::Ls));
+    }
+
+    #[test]
+    fn run_takes_a_vm_and_a_command() {
+        let Command::Run {
+            gui,
+            no_gui,
+            name,
+            command,
+        } = parse(&["run", "ubuntu:24.04", "ls", "-la"])
+        else {
+            panic!("not run");
+        };
+        assert!(!gui && !no_gui);
+        assert_eq!(name.distro.name, "ubuntu");
+        assert_eq!(command, ["ls", "-la"]);
+        assert!(matches!(
+            parse(&["run", "--gui", "ubuntu", "bash"]),
+            Command::Run { gui: true, .. }
+        ));
+    }
+
+    #[test]
+    fn exec_still_works_as_the_old_name_but_is_not_advertised() {
+        assert!(matches!(
+            parse(&["exec", "ubuntu", "bash"]),
+            Command::Run { .. }
+        ));
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("run "), "{help}");
+        assert!(!help.contains("exec"), "{help}");
     }
 
     #[test]
