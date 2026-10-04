@@ -207,11 +207,16 @@ fn build(
         .with_context(|| format!("copying {} to {}", base_disk.display(), disk.display()))?;
     qemu.resize(&disk, disk_bytes)?;
 
+    let family = crate::distro::lookup(&image.distro)
+        .map(|d| d.family)
+        .with_context(|| format!("unknown distro '{}'", image.distro))?;
+
     // Share the host home only where QEMU can, and warn rather than fail where
     // it can't: the VM is still useful without it.
     let transport = if platform.supports_home_share() {
         let support = share::Support {
-            ninep: qemu.supports_9p(),
+            // The guest kernel must have 9p as well as the host QEMU.
+            ninep: qemu.supports_9p() && family.has_9p(),
             virtiofs: qemu.supports_virtiofs(),
         };
         let forced = std::env::var("VMMBOX_SHARE").ok();
@@ -222,6 +227,9 @@ fn build(
                  have its own /home/{}",
                 if forced.is_some() {
                     " the way VMMBOX_SHARE asks"
+                } else if !family.has_9p() {
+                    " (this guest's kernel has no 9p, and virtio-fs needs the QEMU that \
+                     `vmmbox setup` installs)"
                 } else {
                     " (no virtio-9p or virtio-fs)"
                 },
@@ -257,9 +265,6 @@ fn build(
         qemu::prepare_efi_vars(&fw.vars_template, &dir.join("efi-vars.fd"))?;
     }
 
-    let family = crate::distro::lookup(&image.distro)
-        .map(|d| d.family)
-        .with_context(|| format!("unknown distro '{}'", image.distro))?;
     let packages: Vec<&str> = family
         .audio_packages()
         .iter()

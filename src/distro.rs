@@ -14,6 +14,10 @@ pub enum Family {
     Ubuntu,
     Debian,
     Fedora,
+    /// Red Hat Enterprise Linux and its rebuilds: AlmaLinux, Rocky Linux and
+    /// CentOS Stream. Their kernels have no 9p, so the host home is shared over
+    /// virtio-fs, which every kernel has (see share.rs).
+    Rhel,
 }
 
 #[derive(Debug)]
@@ -45,7 +49,28 @@ pub const DISTROS: &[Distro] = &[
         family: Family::Fedora,
         default_version: "44",
     },
+    Distro {
+        name: "almalinux",
+        aliases: &["alma"],
+        family: Family::Rhel,
+        default_version: "10",
+    },
+    Distro {
+        name: "rocky",
+        aliases: &["rockylinux"],
+        family: Family::Rhel,
+        default_version: "10",
+    },
+    Distro {
+        name: "centos-stream",
+        aliases: &["centos"],
+        family: Family::Rhel,
+        default_version: "10",
+    },
 ];
+
+/// RHEL major versions with published generic cloud images.
+const RHEL_VERSIONS: &[&str] = &["9", "10"];
 
 /// Debian release number -> suite name used in cloud.debian.org paths.
 const DEBIAN_SUITES: &[(&str, &str)] = &[("12", "bookworm"), ("13", "trixie")];
@@ -103,6 +128,13 @@ impl ImageRef {
 }
 
 impl Family {
+    /// Whether this family's kernels can mount a 9p share. The RHEL family's
+    /// cannot (`CONFIG_NET_9P` is off), so on a host that can only offer 9p
+    /// their VMs get no shared home rather than a mount that can never work.
+    pub fn has_9p(self) -> bool {
+        self != Family::Rhel
+    }
+
     /// Guest packages for sound: PipeWire with its PulseAudio server (what
     /// browsers and most desktop apps speak), WirePlumber as session manager,
     /// and the ALSA bridge for older apps.
@@ -124,6 +156,10 @@ impl Family {
                 "pipewire-alsa",
                 "pulseaudio-libs",
             ],
+            // Sound and windows are not offered on these yet: the packages are
+            // in EPEL rather than the base repositories, and the kernels' sound
+            // support is untested. Home sharing and the shell work.
+            Family::Rhel => &[],
         }
     }
 
@@ -149,6 +185,7 @@ impl Family {
                 "mesa-vulkan-drivers",
                 "xorg-x11-server-Xwayland",
             ],
+            Family::Rhel => &[],
         }
     }
 
@@ -163,7 +200,7 @@ impl Family {
                  apt-get install -y -qq \"linux-modules-extra-$(uname -r)\"",
             ),
             Family::Fedora => Some("dnf install -y -q \"kernel-modules-$(uname -r)\""),
-            Family::Debian => None,
+            Family::Debian | Family::Rhel => None,
         }
     }
 
@@ -176,6 +213,7 @@ impl Family {
             }
             Family::Debian => DEBIAN_SUITES.iter().any(|(n, _)| *n == v),
             Family::Fedora => all_digits(v),
+            Family::Rhel => RHEL_VERSIONS.contains(&v),
         };
         if ok {
             return Ok(());
@@ -190,7 +228,11 @@ impl Family {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            _ => bail!("invalid version '{v}' (expected a release number such as 10)"),
+            Family::Rhel => bail!(
+                "unsupported version '{v}' (available: {})",
+                RHEL_VERSIONS.join(", ")
+            ),
+            Family::Fedora => bail!("invalid version '{v}' (expected a release number such as 44)"),
         }
     }
 }
@@ -218,9 +260,42 @@ impl Distro {
                 })?;
                 fedora_source(&listing, &base, version, arch)
             }
+            Family::Rhel => rhel_source(self.name, version, arch),
             family => static_source(family, version, arch),
         }
     }
+}
+
+/// AlmaLinux, Rocky and CentOS Stream each publish a "latest" generic cloud
+/// image per major version, and list its checksum in a file beside it.
+fn rhel_source(distro: &str, v: &str, arch: Arch) -> Result<Source> {
+    let a = arch.as_str();
+    Ok(match distro {
+        "almalinux" => simple(
+            &format!("https://repo.almalinux.org/almalinux/{v}/cloud/{a}/images/"),
+            &format!("AlmaLinux-{v}-GenericCloud-latest.{a}.qcow2"),
+            "CHECKSUM",
+            Algo::Sha256,
+        ),
+        "rocky" => simple(
+            &format!("https://dl.rockylinux.org/pub/rocky/{v}/images/{a}/"),
+            &format!("Rocky-{v}-GenericCloud-Base.latest.{a}.qcow2"),
+            "CHECKSUM",
+            Algo::Sha256,
+        ),
+        // One checksum file per image here, named after it.
+        "centos-stream" => {
+            let file = format!("CentOS-Stream-GenericCloud-{v}-latest.{a}.qcow2");
+            let sums = format!("{file}.SHA256SUM");
+            simple(
+                &format!("https://cloud.centos.org/centos/{v}-stream/{a}/images/"),
+                &file,
+                &sums,
+                Algo::Sha256,
+            )
+        }
+        other => bail!("no cloud image source for '{other}'"),
+    })
 }
 
 fn simple(url_dir: &str, file: &str, sums: &str, algo: Algo) -> Source {
@@ -257,6 +332,7 @@ pub fn static_source(family: Family, v: &str, arch: Arch) -> Result<Source> {
             )
         }
         Family::Fedora => bail!("Fedora sources are resolved from the release listing"),
+        Family::Rhel => bail!("RHEL-family sources depend on the distro, not just the family"),
     })
 }
 
@@ -339,10 +415,100 @@ mod tests {
         assert!(parse("ubuntu:24").is_err());
         assert!(parse("debian:99").is_err());
         assert!(parse("fedora:rawhide").is_err());
-        // Dropped: their kernels have no 9p, so the host home can't be shared.
-        assert!(parse("almalinux").is_err());
-        assert!(parse("rocky").is_err());
-        assert!(parse("centos-stream").is_err());
+        assert!(parse("almalinux:8").is_err());
+        assert!(parse("rocky:11").is_err());
+        assert!(parse("centos-stream:rawhide").is_err());
+    }
+
+    #[test]
+    fn rhel_family_references() {
+        for (text, name, version) in [
+            ("almalinux", "almalinux", "10"),
+            ("alma:9", "almalinux", "9"),
+            ("rocky", "rocky", "10"),
+            ("Rocky:9", "rocky", "9"),
+            ("centos", "centos-stream", "10"),
+            ("centos-stream:9", "centos-stream", "9"),
+        ] {
+            let r = parse(text).unwrap();
+            assert_eq!(r.distro.name, name, "{text}");
+            assert_eq!(r.version_or_default(), version, "{text}");
+            assert_eq!(r.distro.family, Family::Rhel);
+        }
+        assert!(
+            parse("alma:8").is_err(),
+            "8 has no 9p-free story and no image"
+        );
+    }
+
+    #[test]
+    fn only_the_rhel_family_lacks_9p() {
+        assert!(Family::Ubuntu.has_9p() && Family::Debian.has_9p() && Family::Fedora.has_9p());
+        assert!(!Family::Rhel.has_9p());
+    }
+
+    #[test]
+    fn rhel_family_urls() {
+        let alma = rhel_source("almalinux", "10", Arch::Aarch64).unwrap();
+        assert_eq!(
+            alma.url,
+            "https://repo.almalinux.org/almalinux/10/cloud/aarch64/images/AlmaLinux-10-GenericCloud-latest.aarch64.qcow2"
+        );
+        assert_eq!(
+            alma.checksum_url,
+            "https://repo.almalinux.org/almalinux/10/cloud/aarch64/images/CHECKSUM"
+        );
+        let rocky = rhel_source("rocky", "9", Arch::X86_64).unwrap();
+        assert_eq!(
+            rocky.url,
+            "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2"
+        );
+        assert_eq!(
+            rocky.checksum_url,
+            "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/CHECKSUM"
+        );
+        let centos = rhel_source("centos-stream", "10", Arch::Aarch64).unwrap();
+        assert_eq!(
+            centos.url,
+            "https://cloud.centos.org/centos/10-stream/aarch64/images/CentOS-Stream-GenericCloud-10-latest.aarch64.qcow2"
+        );
+        // CentOS publishes one checksum file per image.
+        assert_eq!(centos.checksum_url, format!("{}.SHA256SUM", centos.url));
+        assert!(rhel_source("fedora", "10", Arch::Aarch64).is_err());
+    }
+
+    #[test]
+    fn rhel_checksum_files_are_found_in_their_real_formats() {
+        use crate::checksum::find_checksum;
+        let h = |c: char| c.to_string().repeat(64);
+        // AlmaLinux: coreutils lines, many images, dated and "latest".
+        let alma = format!(
+            "{a}  AlmaLinux-10-GenericCloud-10.2-20260817.0.aarch64.qcow2\n\
+             {b}  AlmaLinux-10-GenericCloud-ext4-latest.aarch64.qcow2\n\
+             {c}  AlmaLinux-10-GenericCloud-latest.aarch64.qcow2\n",
+            a = h('a'),
+            b = h('b'),
+            c = h('c')
+        );
+        let want = "AlmaLinux-10-GenericCloud-latest.aarch64.qcow2";
+        assert_eq!(find_checksum(&alma, want, Algo::Sha256), Some(h('c')));
+        // Rocky: BSD lines, the EC2 image beside the generic one.
+        let rocky = format!(
+            "SHA256 (Rocky-9-EC2-Base.latest.aarch64.qcow2) = {a}\n\
+             SHA256 (Rocky-9-GenericCloud-Base.latest.aarch64.qcow2) = {b}\n",
+            a = h('a'),
+            b = h('b')
+        );
+        let want = "Rocky-9-GenericCloud-Base.latest.aarch64.qcow2";
+        assert_eq!(find_checksum(&rocky, want, Algo::Sha256), Some(h('b')));
+        // CentOS Stream: a comment line, then one BSD line.
+        let centos = format!(
+            "# CentOS-Stream-GenericCloud-10-latest.aarch64.qcow2: 884736000 bytes\n\
+             SHA256 (CentOS-Stream-GenericCloud-10-latest.aarch64.qcow2) = {a}\n",
+            a = h('d')
+        );
+        let want = "CentOS-Stream-GenericCloud-10-latest.aarch64.qcow2";
+        assert_eq!(find_checksum(&centos, want, Algo::Sha256), Some(h('d')));
     }
 
     #[test]
