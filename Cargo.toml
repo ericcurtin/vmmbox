@@ -1,6 +1,10 @@
 [package]
 name = "vmmbox"
-version = "0.1.1"
+# MAJOR.MINOR only: CI replaces PATCH with the commit count before building
+# and publishing (packaging/version.sh), so every green commit on main ships
+# as e.g. 0.1.38. Bump MAJOR or MINOR here to start a new series; leave
+# PATCH 0.
+version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Accelerated Linux VMs on QEMU that mirror your user and share your home"

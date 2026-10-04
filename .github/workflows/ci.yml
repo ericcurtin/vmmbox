@@ -1,16 +1,27 @@
 name: CI
 
+# No `tags:` trigger: every commit on main whose jobs all go green is a
+# release. The `tag` job creates v<version> (packaging/version.sh), `release`
+# publishes it, and `publish-packages` points the Homebrew tap and Scoop
+# bucket at it. Pull requests run everything except those three.
+
 on:
   push:
     branches: [main]
   pull_request:
 
+# Workflow-wide default: read-only. Only `tag`, `release` and `untag` write to
+# this repository (the release tag and the GitHub Release); they set their own
+# `permissions: contents: write`.
 permissions:
   contents: read
 
+# A new push to a pull request supersedes its running CI. Pushes to main never
+# cancel each other: every commit there is a release candidate, so each run gets
+# its own group (and a cancelled run would drop its commit's release).
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,27 +52,432 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  # The binaries that get released, built on every run (pull requests too) so a
+  # target that stops building fails before merge, not after. The version is the
+  # release's, so what is smoke-tested here is exactly what is published.
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            asset: vmmbox-aarch64-apple-darwin
+          # musl: a static binary that runs on any Linux, whatever its glibc.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            asset: vmmbox-x86_64-unknown-linux-musl
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            asset: vmmbox-x86_64-pc-windows-msvc.exe
+    steps:
+      # fetch-depth: 0 -- packaging/version.sh needs the full commit count.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Writes MAJOR.MINOR.<commit count> into Cargo.toml and Cargo.lock before
+      # compiling, so `vmmbox --version`, the release tag and the Homebrew and
+      # Scoop packages all carry the same version. Runs on pull requests too, so
+      # a broken script fails before it can ship.
+      - name: Set release version
+        id: version
+        shell: bash
+        run: |
+          version="$(packaging/version.sh --apply)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target "${{ matrix.target }}"
+          rustup default stable
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage
+        shell: bash
+        run: |
+          mkdir dist
+          bin=vmmbox
+          case "${{ matrix.target }}" in *windows*) bin=vmmbox.exe ;; esac
+          cp "target/${{ matrix.target }}/release/$bin" "dist/${{ matrix.asset }}"
+          chmod +x "dist/${{ matrix.asset }}"
+
+      # Run what we ship: the binary must report the release's version.
+      - name: Smoke test
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          want="vmmbox $VERSION"
+          got="$("dist/${{ matrix.asset }}" --version)"
+          echo "$got"
+          [ "$got" = "$want" ] || { echo "::error::expected '$want'"; exit 1; }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
   packaging:
     name: Packaging
     runs-on: ubuntu-24.04
     steps:
+      # fetch-depth: 0 -- version.sh needs the full commit count.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: shellcheck
-        run: shellcheck packaging/render.sh
+        run: shellcheck packaging/render.sh packaging/version.sh packaging/release-tag.sh
+
+      # MAJOR.MINOR from Cargo.toml (PATCH must stay 0), PATCH = commit count;
+      # --apply must leave Cargo.toml and Cargo.lock agreeing.
+      - name: version.sh
+        id: version
+        run: |
+          set -euo pipefail
+          base="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{gsub(/^[^"]*"|".*$/,""); print; exit}' Cargo.toml)"
+          count="$(git rev-list --count HEAD)"
+          want="${base%.*}.$count"
+          got="$(packaging/version.sh)"
+          [ "$got" = "$want" ] || { echo "::error::version.sh printed $got, expected $want"; exit 1; }
+          [ "${base##*.}" = "0" ] || { echo "::error::Cargo.toml PATCH is ${base##*.}, must stay 0 (CI owns it)"; exit 1; }
+
+          packaging/version.sh --apply >/dev/null
+          applied="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          [ "$applied" = "$want" ] || { echo "::error::--apply left Cargo.toml at $applied, expected $want"; exit 1; }
+          cargo metadata --locked --format-version 1 >/dev/null
+          echo "version=$want" >> "$GITHUB_OUTPUT"
+          echo "OK: version $want applied to Cargo.toml and Cargo.lock"
 
       # Render with made-up hashes: catches template/script drift (a leftover
       # placeholder, a renamed asset) on every change instead of at release time.
       - name: Render the packages
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           for asset in vmmbox-aarch64-apple-darwin \
                        vmmbox-x86_64-unknown-linux-musl vmmbox-x86_64-pc-windows-msvc.exe; do
             printf '%s  %s\n' "$(printf '%s' "$asset" | sha256sum | cut -d' ' -f1)" "$asset"
           done > checksums.txt
-          packaging/render.sh --version 0.0.1 --checksums checksums.txt --out-dir rendered
+          packaging/render.sh --version "$VERSION" --checksums checksums.txt --out-dir rendered
 
       - name: Validate the rendered files
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          jq -e '.version == "0.0.1" and .bin == "vmmbox.exe"' rendered/scoop/bucket/vmmbox.json
+          jq -e --arg v "$VERSION" '.version == $v and .bin == "vmmbox.exe"' rendered/scoop/bucket/vmmbox.json
           ruby -c rendered/homebrew/Formula/vmmbox.rb
           ! grep -rn '@[A-Z_]\{2,\}@' rendered
+
+  # --------------------------------------------------------------------------
+  # Tag: v<version> on this commit, as soon as the run starts. GITHUB_TOKEN can
+  # only create a ref whose .github/workflows/ matches main's tip (see
+  # packaging/release-tag.sh), so it is created here, while the commit is the
+  # tip, and not an hour later by `release`. `untag` removes it if the release
+  # never happens.
+  # --------------------------------------------------------------------------
+  tag:
+    name: Tag
+    runs-on: ubuntu-24.04
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+    outputs:
+      tag_name: ${{ steps.version.outputs.tag_name }}
+    steps:
+      # fetch-depth: 0 for the commit count.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine version and tag
+        id: version
+        run: |
+          version="$(packaging/version.sh)"
+          echo "tag_name=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag_name }}
+        run: packaging/release-tag.sh ensure "$TAG" "$GITHUB_SHA"
+
+  # --------------------------------------------------------------------------
+  # Release: a GitHub Release per green commit on main, tagged v<version>. The
+  # build job compiled with that version in Cargo.toml, so the binaries report
+  # it. Non-prerelease, so `releases/latest` tracks main and older builds stay
+  # downloadable by tag. publish-packages hangs off this job: nothing reaches
+  # Homebrew or Scoop until the release their download URLs point at exists.
+  # --------------------------------------------------------------------------
+  release:
+    name: Publish release
+    # Everything must be green first.
+    needs: [tag, test, build, packaging]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+    steps:
+      # fetch-depth: 0 for the commit count.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine version and tag
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(packaging/version.sh)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag_name=v$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing vmmbox $version as tag v$version"
+
+      # The tag job made this; check it is still here and at this commit before
+      # the Releases API would try to create it itself. Recreating it (after
+      # `untag` ran and the failed jobs were re-run) works only while
+      # .github/workflows/ is unchanged on main.
+      - name: Verify release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag_name }}
+        run: packaging/release-tag.sh ensure "$TAG" "$GITHUB_SHA"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      # Every asset, by name, before anything is published, and the one binary
+      # this runner can execute must report this version.
+      - name: Verify release assets
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          for asset in vmmbox-aarch64-apple-darwin vmmbox-x86_64-unknown-linux-musl vmmbox-x86_64-pc-windows-msvc.exe; do
+            [ -s "$asset" ] || { echo "::error::release asset $asset is missing or empty"; exit 1; }
+          done
+          chmod +x vmmbox-x86_64-unknown-linux-musl
+          out="$(./vmmbox-x86_64-unknown-linux-musl --version)"
+          echo "$out"
+          [ "$out" = "vmmbox $VERSION" ] || { echo "::error::binary reports \"$out\", expected \"vmmbox $VERSION\""; exit 1; }
+
+      # Homebrew and Scoop verify against these hashes, and the packages are
+      # rendered from this same file, so they cannot disagree with the binaries.
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum vmmbox-* | tee ../checksums.txt
+          mv ../checksums.txt .
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-checksums
+          path: dist/checksums.txt
+          if-no-files-found: error
+
+      # The release notes are the commit message, minus trailers.
+      - name: Build release notes
+        env:
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          printf '%s\n' "$HEAD_COMMIT_MESSAGE" \
+            | sed -E '/^[[:space:]]*(signed-off-by|co-authored-by):/Id' \
+            | cat -s \
+            | awk '
+                { line[NR] = $0 }
+                END {
+                  last = NR
+                  while (last > 0 && line[last] ~ /^[[:space:]]*-*[[:space:]]*$/) last--
+                  for (i = 1; i <= last; i++) print line[i]
+                }
+              ' > release-notes.md
+          cat release-notes.md
+
+      # The tag exists (verified above), so this creates no ref. `--verify-tag`
+      # fails rather than create one, and no target is sent: GITHUB_TOKEN's
+      # workflows check (see packaging/release-tag.sh) runs on a release's
+      # target whenever one is present, tag or no tag.
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # A re-run after a partial failure must not fail on the existing release.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            exit 0
+          fi
+          # Runs are not ordered: when a newer release already exists, this one
+          # must not take the "Latest" label from it. (The QEMU bundle's
+          # qemu-* releases are not vmmbox's, so only v* tags count.)
+          latest=()
+          newest="$(gh release list --limit 20 --json tagName -q '.[].tagName' | { grep '^v' || true; } | sort -V | tail -n1)"
+          if [ -n "$newest" ] && [ "$newest" != "$TAG" ] \
+             && [ "$(printf '%s\n%s\n' "$newest" "$TAG" | sort -V | tail -n1)" = "$newest" ]; then
+            echo "::notice::$newest is newer; not marking $TAG as the latest release"
+            latest=(--latest=false)
+          fi
+          gh release create "$TAG" dist/* --verify-tag --title "vmmbox $VERSION" \
+            --notes-file release-notes.md "${latest[@]}"
+
+  # --------------------------------------------------------------------------
+  # No release, no tag: a failed or cancelled run must not leave v<version> on
+  # an unreleased commit. Leaves a tag that has a release (an upload failure is
+  # fixed by re-running). Deleting a ref is not subject to the workflows
+  # restriction.
+  # --------------------------------------------------------------------------
+  untag:
+    name: Remove unreleased tag
+    needs: [tag, release]
+    # always(): also after a cancellation. Skipped unless `tag` made one.
+    if: always() && needs.tag.result == 'success' && needs.release.result != 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Delete tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.tag.outputs.tag_name }}
+        run: packaging/release-tag.sh remove "$TAG" "$GITHUB_SHA"
+
+  publish-packages:
+    name: Publish ${{ matrix.name }}
+    needs: release
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Homebrew formula
+            id: homebrew
+            repo: ericcurtin/homebrew-tap
+            # The version appears only in the download URL.
+            file: Formula/vmmbox.rb
+            version_sed: 's|.*/releases/download/v\([0-9.]*\)/.*|\1|p'
+          - name: Scoop manifest
+            id: scoop
+            repo: ericcurtin/scoop-bucket
+            file: bucket/vmmbox.json
+            version_sed: 's/^    "version": "\(.*\)",$/\1/p'
+    # Queue, never cancel: two close releases must not interleave their pushes.
+    concurrency:
+      group: publish-${{ matrix.id }}
+      cancel-in-progress: false
+    steps:
+      # Pushing to another repository needs a token with write access to it;
+      # the default GITHUB_TOKEN only covers this repository.
+      - name: Require the tap token
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$TAP_GITHUB_TOKEN" ]; then
+            echo "::error::secret TAP_GITHUB_TOKEN is not set. Create a fine-grained token with Contents: read and write on ericcurtin/homebrew-tap and ericcurtin/scoop-bucket, add it as a repository secret, then re-run this job."
+            exit 1
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-checksums
+
+      - name: Render
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          packaging/render.sh \
+            --version "$VERSION" \
+            --checksums checksums.txt \
+            --out-dir rendered
+
+      - name: Check out ${{ matrix.repo }}
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ matrix.repo }}
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: target-repo
+
+      - name: Commit and push
+        working-directory: target-repo
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          SRC: ${{ github.sha }}
+          PKG: ${{ matrix.id }}
+          REPO: ${{ matrix.repo }}
+          FILE: ${{ matrix.file }}
+          VERSION_SED: ${{ matrix.version_sed }}
+        run: |
+          set -euo pipefail
+          git config user.name "vmmbox-ci"
+          git config user.email "vmmbox-ci@users.noreply.github.com"
+          branch="$(git symbolic-ref --quiet --short HEAD || true)"
+          if [ -z "$branch" ]; then
+            branch="$(git remote show origin | sed -n 's/.*HEAD branch: //p')"
+          fi
+
+          # Generated output: on a rejected push, re-sync and regenerate on top
+          # rather than rebase.
+          for attempt in 1 2 3 4 5; do
+            git fetch --quiet origin "$branch"
+            git reset --quiet --hard FETCH_HEAD
+
+            # Never downgrade: two releases can finish out of order.
+            if [ -f "$FILE" ]; then
+              have="$(sed -n "$VERSION_SED" "$FILE" | head -n1)"
+              if [ -n "$have" ] && [ "$have" != "$VERSION" ] \
+                 && [ "$(printf '%s\n%s\n' "$have" "$VERSION" | sort -V | tail -n1)" = "$have" ]; then
+                echo "::notice::$REPO already has vmmbox $have, newer than $VERSION; leaving it"
+                exit 0
+              fi
+            fi
+
+            cp -R "../rendered/$PKG/." .
+            git add -A .
+            if git diff --cached --quiet; then
+              echo "::notice::$REPO already up to date for $VERSION"
+              exit 0
+            fi
+
+            git commit --quiet -m "vmmbox $VERSION" \
+              -m "Generated from ${{ github.repository }}@$SRC by packaging/render.sh."
+            if git push --quiet origin "HEAD:$branch"; then
+              echo "Pushed vmmbox $VERSION to $REPO"
+              exit 0
+            fi
+            echo "::warning::push to $REPO rejected (attempt $attempt/5); re-syncing"
+            sleep "$((attempt * 3))"
+          done
+          echo "::error::could not push vmmbox $VERSION to $REPO after 5 attempts"
+          exit 1
