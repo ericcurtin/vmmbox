@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 /// Start `cmd` detached from this process: it must outlive vmmbox and must not
 /// die with the terminal. Its output goes to `log`.
@@ -41,6 +41,24 @@ fn with_process<T>(pid: u32, f: impl FnOnce(&sysinfo::Process) -> T) -> Option<T
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
     sys.process(pid).map(f)
+}
+
+/// Terminate `pid` if it is a `vmmbox virtiofsd`. The command line is checked,
+/// not just the name, so a pid reused by some other `vmmbox` invocation (a
+/// concurrent `vmmbox run`, say) is left alone.
+pub fn kill_virtiofsd(pid: u32) -> bool {
+    let pid = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    sys.process(pid).is_some_and(|p| {
+        p.name().to_string_lossy().contains("vmmbox")
+            && p.cmd().iter().any(|a| a == "virtiofsd")
+            && p.kill()
+    })
 }
 
 /// Whether `pid` is a live QEMU process. Checking the name guards against pid

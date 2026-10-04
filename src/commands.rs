@@ -2,14 +2,16 @@
 
 use crate::bundle;
 use crate::distro::{self, ImageRef};
+use crate::fsd;
 use crate::gui::{self, Gui};
 use crate::host::{self, Arch, Platform};
 use crate::http::Http;
 use crate::image::{Images, Pulled};
 use crate::paths::Paths;
-use crate::qemu::{self, Gpu, Launch, Qemu};
+use crate::qemu::{self, Gpu, HomeShare, Launch, Qemu};
 use crate::qmp::Endpoint;
 use crate::resources;
+use crate::share::Transport;
 use crate::ssh::Ssh;
 use crate::util::{
     dir_size, format_ago, format_bytes, format_duration, now_secs, sh_quote, table, tail_lines,
@@ -307,10 +309,31 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
     let disk = vm.disk();
     let seed = vm.seed();
     let console_log = vm.console_log();
-    let share = vm
-        .state
-        .home_shared
-        .then(|| PathBuf::from(&vm.state.host_home));
+    let host_home = PathBuf::from(&vm.state.host_home);
+    // For a virtio-fs share the server must be listening before QEMU starts, and
+    // must not be left behind if the start fails.
+    let mut fsd = FsdGuard::new();
+    let vfs_socket: PathBuf;
+    let share = if !vm.state.home_shared {
+        None
+    } else if vm.state.home_transport == Transport::VirtioFs {
+        if !qemu.supports_virtiofs() {
+            bail!(
+                "{name} shares your home over virtio-fs, which needs the QEMU that vmmbox \
+                 installs (`vmmbox setup`); {} cannot do it",
+                qemu.system.display()
+            );
+        }
+        let (pid, socket) = fsd::start(paths, vm, &host_home)?;
+        fsd.started = Some((pid, socket.clone()));
+        vm.state.fsd_pid = Some(pid);
+        vfs_socket = socket;
+        Some(HomeShare::VirtioFs {
+            socket: &vfs_socket,
+        })
+    } else {
+        Some(HomeShare::NineP { dir: &host_home })
+    };
     let audio = qemu.audio(platform.os);
     let mut gpu = qemu.gpu(platform.os);
 
@@ -324,7 +347,7 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
             seed: &seed,
             efi: efi.as_deref().map(|code| (code, efi_vars.as_path())),
             ssh_port,
-            share: share.as_deref(),
+            share,
             console_log: &console_log,
             qmp: &endpoint,
             audio: audio.as_ref(),
@@ -424,6 +447,7 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
         }
     }
 
+    fsd.disarm();
     Ok(Booted {
         elapsed: started.elapsed(),
         gpu,
@@ -447,11 +471,17 @@ fn print_summary(paths: &Paths, platform: Platform, vm: &Vm, booted: &Booted) {
     }
     println!("  User:   {} (uid {}, gid {})", s.user, s.uid, s.gid);
     if s.home_shared && s.guest_home == s.host_home {
-        println!("  Home:   {} (shared with the host)", s.guest_home);
+        println!(
+            "  Home:   {} (shared with the host over {})",
+            s.guest_home,
+            s.home_transport.name()
+        );
     } else if s.home_shared {
         println!(
-            "  Home:   {} (on the VM); your host home is mounted at {}",
-            s.guest_home, s.host_home
+            "  Home:   {} (on the VM); your host home is mounted at {} over {}",
+            s.guest_home,
+            s.host_home,
+            s.home_transport.name()
         );
     } else {
         println!("  Home:   {}", s.guest_home);
@@ -461,6 +491,35 @@ fn print_summary(paths: &Paths, platform: Platform, vm: &Vm, booted: &Booted) {
         Err(e) => println!("  GUI:    unavailable: {e}"),
     }
     println!("Run `vmmbox run {name} bash` for a shell.");
+}
+
+/// The virtio-fs server started for a boot, until QEMU has connected to it: if
+/// the boot fails before that, dropping this stops the server instead of
+/// leaving it to wait for a connection that will never come.
+struct FsdGuard {
+    /// The server's pid and socket, until QEMU has connected.
+    started: Option<(u32, PathBuf)>,
+}
+
+impl FsdGuard {
+    fn new() -> Self {
+        Self { started: None }
+    }
+
+    /// QEMU has the server's socket now, and the server ends with QEMU.
+    fn disarm(&mut self) {
+        self.started = None;
+    }
+}
+
+impl Drop for FsdGuard {
+    fn drop(&mut self) {
+        if let Some((pid, socket)) = self.started.take() {
+            fsd::stop(pid);
+            // Killed before it could remove its own socket.
+            let _ = std::fs::remove_file(socket);
+        }
+    }
 }
 
 fn wait_exit(pid: u32, timeout: Duration) -> bool {
@@ -509,6 +568,10 @@ fn stop_vm(paths: &Paths, vm: &mut Vm) -> Result<bool> {
     }
 
     endpoint.cleanup();
+    // The virtio-fs server ends when QEMU does; make sure of it.
+    if let Some(pid) = vm.state.fsd_pid.take() {
+        fsd::stop(pid);
+    }
     vm.state.pid = None;
     vm.state.started_at = None;
     vm.save()?;
@@ -747,6 +810,8 @@ mod tests {
             guest_home: "/home/me".into(),
             host_home: "/Users/me".into(),
             home_shared: true,
+            home_transport: Transport::NineP,
+            fsd_pid: None,
             booted_before: true,
             pid,
             ssh_port: 2222,

@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use super::LOG_LEVEL;
 use super::descriptor_utils::{Reader, Writer};
 use super::inode_alloc::InodeAllocator;
-use super::passthrough::{CachePolicy, Config, PassthroughFs};
+use super::passthrough::{CachePolicy, Config, PassthroughFs, PermissionSemantics};
 use super::server::Server;
 use super::vhost_user::{self, Backend, Outcome};
 
@@ -69,6 +69,16 @@ fn make_server(root: &Path) -> Result<Server<PassthroughFs>> {
         // The host changes files without telling the guest, so the guest must
         // not hold writes back.
         writeback: false,
+        // The default keeps the guest's idea of owner and mode in a hidden
+        // extended attribute and leaves the real file alone, which is right for
+        // a container image and wrong for a home directory: `chmod +x` in the
+        // guest must make the file executable on the host too, and the host's
+        // files must not each grow an attribute. This keeps the real mode bits.
+        // The price is no extended attributes, and ownership reported as the
+        // caller's; the guest user has the host user's uid, so that is who owns
+        // the files anyway.
+        semantics: PermissionSemantics::LinuxSimplified,
+        xattr: false,
         ..Config::default()
     };
     let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new()))

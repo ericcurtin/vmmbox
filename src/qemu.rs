@@ -3,10 +3,10 @@
 //! Guests are always hardware-accelerated (KVM / HVF / WHPX) and always the
 //! host's own architecture; there is no TCG fallback.
 
-use crate::cloudinit::HOME_TAG;
 use crate::host::{Accel, Arch, Os, Platform};
 use crate::paths::Paths;
 use crate::qmp::Endpoint;
+use crate::share::HOME_TAG;
 use crate::tools::{exe_name, find_binary};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -282,6 +282,17 @@ impl Qemu {
         self.has_device("virtio-9p-pci")
     }
 
+    /// Whether this build can attach a virtio-fs device, which needs vhost-user
+    /// and the shared-memory RAM backend. Homebrew's QEMU has neither on macOS;
+    /// the build vmmbox ships has both.
+    pub fn supports_virtiofs(&self) -> bool {
+        self.has_device("vhost-user-fs-pci")
+            && self
+                .run_help(&["-object", "help"])
+                .lines()
+                .any(|l| l.trim() == "memory-backend-shm")
+    }
+
     /// How to give the guest a host-accelerated GPU, or why it gets none.
     /// `VMMBOX_GPU=none` turns it off; `VMMBOX_GPU=opengl` leaves out Vulkan.
     pub fn gpu(&self, os: Os) -> std::result::Result<Gpu, String> {
@@ -428,6 +439,15 @@ pub fn prepare_efi_vars(template: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How the host home is attached to the guest. See `share.rs`.
+#[derive(Clone, Copy, Debug)]
+pub enum HomeShare<'a> {
+    /// QEMU serves `dir` itself, over virtio-9p.
+    NineP { dir: &'a Path },
+    /// A separate server, already listening on `socket`, serves it over virtio-fs.
+    VirtioFs { socket: &'a Path },
+}
+
 /// Everything needed to describe one VM boot.
 pub struct Launch<'a> {
     pub name: &'a str,
@@ -440,7 +460,7 @@ pub struct Launch<'a> {
     pub efi: Option<(&'a Path, &'a Path)>,
     pub ssh_port: u16,
     /// Host directory to expose to the guest over 9p.
-    pub share: Option<&'a Path>,
+    pub share: Option<HomeShare<'a>>,
     pub console_log: &'a Path,
     pub qmp: &'a Endpoint,
     pub audio: Option<&'a Audio>,
@@ -481,7 +501,18 @@ pub fn build_args(l: &Launch) -> Result<Vec<String>> {
             accel.name()
         ),
     };
-    a.kv("-machine", machine.to_string());
+    // virtio-fs's server reaches guest RAM through a shared mapping of it, so
+    // the RAM has to be a shareable object. POSIX shm, as macOS has no memfd; on
+    // HVF it boots as fast as plain RAM and copies at the same speed.
+    let shared_ram = matches!(l.share, Some(HomeShare::VirtioFs { .. }));
+    a.kv(
+        "-machine",
+        if shared_ram {
+            format!("{machine},memory-backend=mem0")
+        } else {
+            machine.to_string()
+        },
+    );
     a.kv("-accel", accel.to_string());
     a.kv("-cpu", cpu.to_string());
     a.kv("-smp", l.cpus.to_string());
@@ -536,20 +567,36 @@ pub fn build_args(l: &Launch) -> Result<Vec<String>> {
     a.kv("-device", "virtio-net-pci,netdev=net0".into());
     a.kv("-device", "virtio-rng-pci".into());
 
-    if let Some(dir) = l.share {
-        // security_model=none: the guest sees real host ownership and modes, which
-        // is correct because the guest user has the host user's uid/gid.
-        a.kv(
-            "-fsdev",
-            format!(
-                "local,id=fsdev0,path={},security_model=none,multidevs=remap",
-                path(dir)
-            ),
-        );
-        a.kv(
-            "-device",
-            format!("virtio-9p-pci,fsdev=fsdev0,mount_tag={HOME_TAG}"),
-        );
+    match l.share {
+        Some(HomeShare::NineP { dir }) => {
+            // security_model=none: the guest sees real host ownership and modes,
+            // which is correct because the guest user has the host user's
+            // uid/gid.
+            a.kv(
+                "-fsdev",
+                format!(
+                    "local,id=fsdev0,path={},security_model=none,multidevs=remap",
+                    path(dir)
+                ),
+            );
+            a.kv(
+                "-device",
+                format!("virtio-9p-pci,fsdev=fsdev0,mount_tag={HOME_TAG}"),
+            );
+        }
+        Some(HomeShare::VirtioFs { socket }) => {
+            // The server (`vmmbox virtiofsd`) is already listening on `socket`.
+            a.kv(
+                "-object",
+                format!("memory-backend-shm,id=mem0,size={}M,share=on", l.memory_mib),
+            );
+            a.kv("-chardev", format!("socket,id=vfs,path={}", path(socket)));
+            a.kv(
+                "-device",
+                format!("vhost-user-fs-pci,chardev=vfs,tag={HOME_TAG}"),
+            );
+        }
+        None => {}
     }
 
     if let Some(audio) = l.audio {
@@ -600,7 +647,7 @@ mod tests {
     fn launch<'a>(
         platform: Platform,
         endpoint: &'a Endpoint,
-        share: Option<&'a Path>,
+        share: Option<HomeShare<'a>>,
     ) -> Launch<'a> {
         Launch {
             name: "ubuntu",
@@ -635,7 +682,10 @@ mod tests {
             os: Os::Mac,
             arch: Arch::Aarch64,
         };
-        let args = build_args(&launch(platform, &ep, Some(Path::new("/Users/me")))).unwrap();
+        let share = HomeShare::NineP {
+            dir: Path::new("/Users/me"),
+        };
+        let args = build_args(&launch(platform, &ep, Some(share))).unwrap();
         assert!(has_pair(&args, "-machine", "virt"));
         assert!(has_pair(&args, "-accel", "hvf"));
         assert!(has_pair(&args, "-cpu", "host"));
@@ -717,6 +767,62 @@ mod tests {
                 .iter()
                 .any(|a| a.contains("audiodev"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_virtiofs_share_uses_shared_ram_and_a_vhost_user_device() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        };
+        let share = HomeShare::VirtioFs {
+            socket: Path::new("/tmp/vmmbox-501/ubuntu.vfs.sock"),
+        };
+        let args = build_args(&launch(platform, &ep, Some(share))).unwrap();
+        // The server maps guest RAM, so the RAM must be a shareable object, and
+        // it must be the machine's RAM, of the same size as -m.
+        assert!(has_pair(&args, "-machine", "virt,memory-backend=mem0"));
+        assert!(has_pair(
+            &args,
+            "-object",
+            "memory-backend-shm,id=mem0,size=32768M,share=on"
+        ));
+        assert!(has_pair(
+            &args,
+            "-chardev",
+            "socket,id=vfs,path=/tmp/vmmbox-501/ubuntu.vfs.sock"
+        ));
+        assert!(has_pair(
+            &args,
+            "-device",
+            "vhost-user-fs-pci,chardev=vfs,tag=vmmhome"
+        ));
+        assert!(has_pair(&args, "-m", "32768"));
+        // And none of 9p.
+        assert!(!args.iter().any(|a| a.contains("9p") || a.contains("fsdev")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_9p_share_and_no_share_leave_ram_alone() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        };
+        for share in [
+            Some(HomeShare::NineP {
+                dir: Path::new("/Users/me"),
+            }),
+            None,
+        ] {
+            let args = build_args(&launch(platform, &ep, share)).unwrap();
+            assert!(has_pair(&args, "-machine", "virt"));
+            assert!(!args.iter().any(|a| a.contains("memory-backend")));
+            assert!(!args.iter().any(|a| a.contains("vhost-user")));
+        }
     }
 
     #[cfg(unix)]

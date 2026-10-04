@@ -28,15 +28,13 @@
 //!   (non-unique GID).
 
 use crate::host::HostUser;
+use crate::share::{HOME_TAG, Transport};
 use crate::util::sh_quote;
 use anyhow::{Context, Result};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
-/// 9p mount tag shared between the QEMU command line and the guest fstab.
-pub const HOME_TAG: &str = "vmmhome";
-const MOUNT_OPTS: &str = "trans=virtio,version=9p2000.L,msize=512000,cache=mmap,nofail";
 const SEED_SIZE: u64 = 4 << 20;
 
 pub struct Seed<'a> {
@@ -51,6 +49,8 @@ pub struct Seed<'a> {
     pub host_home: &'a str,
     /// Whether the host home is shared into the guest at all.
     pub share_home: bool,
+    /// How it is shared: the file system type the guest's fstab names.
+    pub transport: Transport,
     /// Packages to install on first boot (the audio stack).
     pub packages: &'a [&'a str],
     /// Command that installs sound kernel modules for the running kernel.
@@ -98,21 +98,18 @@ impl Seed<'_> {
             gid = self.user.gid,
         );
         if self.share_home {
-            let nine_p = format!(
-                "{HOME_TAG} {} 9p {MOUNT_OPTS} 0 0",
-                fstab_escape(self.host_home)
-            );
+            let fstab_entry = self.transport.fstab_line(&fstab_escape(self.host_home));
             s.push_str(&format!(
                 "home={host}\n\
                  changed=0\n\
                  mkdir -p \"$home\"\n\
                  if ! grep -qs '^{tag}[[:space:]]' /etc/fstab; then\n\
-                 \x20 printf '%s\\n' {nine_p} >> /etc/fstab\n\
+                 \x20 printf '%s\\n' {fstab_entry} >> /etc/fstab\n\
                  \x20 changed=1\n\
                  fi\n",
                 host = sh_quote(self.host_home),
                 tag = HOME_TAG,
-                nine_p = sh_quote(&nine_p),
+                fstab_entry = sh_quote(&fstab_entry),
             ));
             s.push_str(
                 "if [ \"$changed\" = 1 ] && command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi\n\
@@ -300,9 +297,31 @@ mod tests {
             guest_home: "/home/ecurtin",
             host_home,
             share_home: share,
+            transport: Transport::NineP,
             packages: &["pipewire", "wireplumber"],
             kernel_modules_cmd: Some("apt-get install -y \"linux-modules-extra-$(uname -r)\""),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_virtiofs_share_is_mounted_as_virtiofs_and_nothing_else_changes() {
+        let u = user();
+        let mut s = seed(&u, true);
+        s.transport = Transport::VirtioFs;
+        let ud = s.user_data();
+        assert!(
+            ud.contains("vmmhome /Users/ecurtin virtiofs defaults,nofail 0 0"),
+            "{ud}"
+        );
+        assert!(!ud.contains(" 9p "), "no 9p entry for a virtio-fs VM");
+        // The same VM with 9p differs only in that line.
+        let nine = seed(&u, true).user_data();
+        assert!(
+            nine.contains("vmmhome /Users/ecurtin 9p trans=virtio"),
+            "{nine}"
+        );
+        assert!(!nine.contains("virtiofs"));
     }
 
     #[test]

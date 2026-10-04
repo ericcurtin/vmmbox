@@ -7,6 +7,7 @@ mod cloudinit;
 mod commands;
 mod cpu;
 mod distro;
+mod fsd;
 mod gui;
 mod host;
 mod http;
@@ -17,6 +18,7 @@ mod qemu;
 mod qemu_pins;
 mod qmp;
 mod resources;
+mod share;
 mod ssh;
 #[cfg(test)]
 mod testutil;
