@@ -7,13 +7,12 @@
 /// Upstream QEMU version in the bundle.
 pub const VERSION: &str = "11.0.5";
 /// Bundle revision: bumped when only the build recipe changes.
-pub const REV: u32 = 1;
+pub const REV: u32 = 2;
 /// The oldest macOS major version the bundle runs on.
 pub const MIN_MACOS: u32 = 15;
 
 /// SHA-256 of each published archive, by target. A target with no entry has no
 /// bundle, and vmmbox uses the QEMU it finds on the system instead.
-pub const PINS: &[(&str, &str)] = &[(
-    "aarch64-apple-darwin",
-    "387e4c89bbf12a562d189c4eae8f69679be9ba9e71e35e562a4782054f85de3f",
-)];
+pub const PINS: &[(&str, &str)] = &[
+    ("aarch64-apple-darwin", "4cc159800ef02e4faffe502c1ef9bfb8f6170d0c29a8e2521a4b599d1efea17c"),
+];
