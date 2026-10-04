@@ -27,8 +27,6 @@ MIN_MACOS="${SMOKE_MIN_MACOS:-$MIN_MACOS}"
 case "$target" in
 aarch64-apple-darwin)
 	arch=aarch64 accel=hvf audio=coreaudio machine=virt firmware="edk2-aarch64-code.fd edk2-arm-vars.fd" ;;
-x86_64-apple-darwin)
-	arch=x86_64 accel=hvf audio=coreaudio machine=q35 firmware="bios-256k.bin kvmvapic.bin linuxboot_dma.bin" ;;
 *) die "unknown target: $target" ;;
 esac
 

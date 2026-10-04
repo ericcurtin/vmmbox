@@ -3,7 +3,7 @@
 #
 #   packaging/qemu/build.sh <target> [--work DIR] [--out DIR]
 #
-#   target   aarch64-apple-darwin or x86_64-apple-darwin
+#   target   aarch64-apple-darwin
 #   --work   scratch directory (default: ./build/qemu)
 #   --out    where the .tar.gz and its .sha256 go (default: ./dist)
 #
@@ -55,14 +55,6 @@ aarch64-apple-darwin)
 	# separate process that QEMU reaches over a vhost-user socket.
 	CONFIGURE_FLAGS=(--enable-tcg --enable-hvf --enable-coreaudio --audio-drv-list=coreaudio --enable-vhost-user)
 	KEEP_FIRMWARE=(edk2-aarch64-code.fd edk2-arm-vars.fd edk2-licenses.txt)
-	;;
-x86_64-apple-darwin)
-	SYSTEM_TARGET=x86_64-softmmu
-	SYSTEM_BIN=qemu-system-x86_64
-	FLAVOUR=macos
-	CONFIGURE_FLAGS=(--enable-tcg --enable-hvf --enable-coreaudio --audio-drv-list=coreaudio --enable-vhost-user)
-	# SeaBIOS and what it loads; the q35 machine vmmbox uses has no UEFI.
-	KEEP_FIRMWARE=(bios-256k.bin kvmvapic.bin linuxboot_dma.bin)
 	;;
 *) die "unsupported target: $TARGET" ;;
 esac

@@ -45,11 +45,10 @@ pub enum Outcome {
 fn host_target(platform: Platform) -> &'static str {
     match (platform.os, platform.arch) {
         (Os::Mac, Arch::Aarch64) => "aarch64-apple-darwin",
-        (Os::Mac, Arch::X86_64) => "x86_64-apple-darwin",
         (Os::Linux, Arch::X86_64) => "x86_64-unknown-linux-gnu",
         (Os::Windows, Arch::X86_64) => "x86_64-pc-windows-gnu",
         // Not supported hosts; Platform::current() rejects these first.
-        (Os::Linux | Os::Windows, Arch::Aarch64) => "unsupported",
+        (Os::Mac, Arch::X86_64) | (Os::Linux | Os::Windows, Arch::Aarch64) => "unsupported",
     }
 }
 
@@ -503,7 +502,10 @@ mod tests {
         assert!(!is_current(&paths, target), "nothing installed yet");
         install_archive(&paths, &archive, target, VERSION, REV).unwrap();
         assert!(is_current(&paths, target));
-        assert!(!is_current(&paths, "x86_64-apple-darwin"), "other target");
+        assert!(
+            !is_current(&paths, "x86_64-unknown-linux-gnu"),
+            "other target"
+        );
         std::fs::remove_file(paths.bin().join("qemu-img")).unwrap();
         assert!(
             !is_current(&paths, target),

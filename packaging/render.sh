@@ -94,7 +94,6 @@ sha_for() {
 }
 
 SHA_MACOS_ARM64="$(sha_for vmmbox-aarch64-apple-darwin)"
-SHA_MACOS_X86_64="$(sha_for vmmbox-x86_64-apple-darwin)"
 SHA_LINUX_X86_64="$(sha_for vmmbox-x86_64-unknown-linux-musl)"
 SHA_WINDOWS_X86_64="$(sha_for vmmbox-x86_64-pc-windows-msvc.exe)"
 
@@ -108,7 +107,6 @@ render() {
 		-e "s|@DESCRIPTION@|$DESCRIPTION|g" \
 		-e "s|@BASE_URL@|$BASE_URL|g" \
 		-e "s|@SHA_MACOS_ARM64@|$SHA_MACOS_ARM64|g" \
-		-e "s|@SHA_MACOS_X86_64@|$SHA_MACOS_X86_64|g" \
 		-e "s|@SHA_LINUX_X86_64@|$SHA_LINUX_X86_64|g" \
 		-e "s|@SHA_WINDOWS_X86_64@|$SHA_WINDOWS_X86_64|g" \
 		"$1"

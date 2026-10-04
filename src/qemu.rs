@@ -21,7 +21,7 @@ pub fn escape(s: &str) -> String {
 /// Where package managers put QEMU when it isn't on PATH.
 fn well_known_dirs(os: Os) -> Vec<PathBuf> {
     match os {
-        Os::Mac => ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"]
+        Os::Mac => ["/opt/homebrew/bin", "/opt/local/bin"]
             .map(PathBuf::from)
             .to_vec(),
         Os::Linux => ["/usr/bin", "/usr/local/bin", "/usr/libexec"]
@@ -369,8 +369,7 @@ impl Qemu {
             dirs.push(bin.join("share")); // Windows installer layout
         }
         match os {
-            Os::Mac => dirs
-                .extend(["/opt/homebrew/share/qemu", "/usr/local/share/qemu"].map(PathBuf::from)),
+            Os::Mac => dirs.extend(["/opt/homebrew/share/qemu"].map(PathBuf::from)),
             Os::Linux => dirs.extend(
                 [
                     "/usr/share/qemu",
@@ -501,7 +500,6 @@ pub fn build_args(l: &Launch) -> Result<Vec<String>> {
     let (machine, accel, cpu) = match (l.platform.arch, l.platform.accel()) {
         (Arch::Aarch64, Accel::Hvf) => ("virt", "hvf", "host"),
         (Arch::X86_64, Accel::Kvm) => ("q35", "kvm", "host"),
-        (Arch::X86_64, Accel::Hvf) => ("q35", "hvf", "host"),
         // `host` isn't dependable under WHPX; `max` exposes what it supports.
         // kernel-irqchip=off avoids known WHPX interrupt-controller issues.
         (Arch::X86_64, Accel::Whpx) => ("q35", "whpx,kernel-irqchip=off", "max"),
@@ -946,6 +944,18 @@ mod tests {
             arch: Arch::Aarch64,
         };
         assert!(build_args(&launch(platform, &ep, None)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intel_macs_are_not_supported() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Mac,
+            arch: Arch::X86_64,
+        };
+        let err = build_args(&launch(platform, &ep, None)).unwrap_err();
+        assert!(err.to_string().contains("no accelerated machine"), "{err}");
     }
 
     #[cfg(unix)]

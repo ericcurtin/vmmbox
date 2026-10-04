@@ -52,10 +52,9 @@ impl Accel {
     }
 }
 
-/// The host platforms vmmbox supports. aarch64 is only supported on macOS.
+/// The host platforms vmmbox supports. macOS is Apple silicon only.
 const SUPPORTED: &[(Os, Arch)] = &[
     (Os::Mac, Arch::Aarch64),
-    (Os::Mac, Arch::X86_64),
     (Os::Linux, Arch::X86_64),
     (Os::Windows, Arch::X86_64),
 ];
@@ -86,7 +85,7 @@ impl Platform {
         };
         if !SUPPORTED.contains(&(os, arch)) {
             bail!(
-                "unsupported host: {} on {} (supported: macOS aarch64/x86_64, Linux x86_64, Windows x86_64)",
+                "unsupported host: {} on {} (supported: macOS aarch64, Linux x86_64, Windows x86_64)",
                 os.name(),
                 arch.as_str()
             );
@@ -288,6 +287,20 @@ pub fn current_user() -> Result<HostUser> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_supported_hosts_are_exactly_these() {
+        // macOS is Apple silicon only: there is no Intel Mac support.
+        assert!(!SUPPORTED.contains(&(Os::Mac, Arch::X86_64)));
+        assert_eq!(
+            SUPPORTED,
+            &[
+                (Os::Mac, Arch::Aarch64),
+                (Os::Linux, Arch::X86_64),
+                (Os::Windows, Arch::X86_64)
+            ]
+        );
+    }
 
     #[test]
     fn usernames() {

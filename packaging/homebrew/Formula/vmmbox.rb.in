@@ -15,14 +15,12 @@ class Vmmbox < Formula
   uses_from_macos "curl"
 
   on_macos do
-    on_arm do
-      url "@BASE_URL@/vmmbox-aarch64-apple-darwin"
-      sha256 "@SHA_MACOS_ARM64@"
-    end
-    on_intel do
-      url "@BASE_URL@/vmmbox-x86_64-apple-darwin"
-      sha256 "@SHA_MACOS_X86_64@"
-    end
+    # Only Apple silicon is supported on macOS; this gives Intel Macs a clear
+    # Homebrew error instead of a missing download.
+    depends_on arch: :arm64
+
+    url "@BASE_URL@/vmmbox-aarch64-apple-darwin"
+    sha256 "@SHA_MACOS_ARM64@"
   end
 
   on_linux do

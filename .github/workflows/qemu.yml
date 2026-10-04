@@ -1,7 +1,7 @@
 name: QEMU bundle
 
-# Builds vmmbox's own QEMU for macOS from the pinned upstream tarball (no
-# patches) and publishes it. Pushing a tag qemu-<version>-r<rev> publishes a
+# Builds vmmbox's own QEMU for Apple silicon Macs from the pinned upstream
+# tarball (no patches) and publishes it. Pushing a tag qemu-<version>-r<rev> publishes a
 # release with that name; the tag must match packaging/qemu/VERSION. Running it
 # by hand only builds and tests, and keeps the archives as workflow artifacts.
 #
@@ -32,8 +32,6 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             runner: macos-15
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies

@@ -26,12 +26,6 @@ jobs:
             runner: macos-latest
             asset: vmmbox-aarch64-apple-darwin
             native: true
-          # Cross-compiled on the Apple silicon runner; there are no C
-          # dependencies, so it needs nothing but the target.
-          - target: x86_64-apple-darwin
-            runner: macos-latest
-            asset: vmmbox-x86_64-apple-darwin
-            native: false
           # musl: a static binary that runs on any Linux, whatever its glibc.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04

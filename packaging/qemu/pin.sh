@@ -15,7 +15,7 @@ HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 REPO="${REPO:-ericcurtin/vmmbox}"
 TAG="${1:-qemu-$QEMU_VERSION-r$BUNDLE_REV}"
 OUT="$HERE/../../src/qemu_pins.rs"
-TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
+TARGETS=(aarch64-apple-darwin)
 
 die() { printf 'pin.sh: %s\n' "$*" >&2; exit 1; }
 
