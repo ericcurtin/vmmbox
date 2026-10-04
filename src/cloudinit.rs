@@ -3,10 +3,16 @@
 //!
 //! Design notes:
 //!
-//! * The guest user gets the host's login name, UID and GID, and its home
-//!   directory *is* the host home (same path), shared over 9p. File ownership
-//!   therefore matches on both sides.
-//! * Because the home is the host's, `~/.ssh/authorized_keys` must not be
+//! * The guest user gets the host's login name, UID and GID, and its home is
+//!   always `/home/<user>`, so `$HOME` is what a Linux user expects. The host
+//!   home is shared over 9p, so file ownership matches on both sides:
+//!   - If the host home is at `/home/<user>` too (typical on Linux) it is
+//!     mounted right there: one direct mount, and that *is* the guest home.
+//!   - Otherwise (`/Users/me` on macOS, `/var/home/me` on Silverblue) it is
+//!     mounted at its own host path, so absolute host paths work in the guest,
+//!     and `/home/<user>` is an ordinary directory on the VM's own disk. Linux
+//!     dotfiles, caches and configs then stay out of the host home.
+//! * Because the home can be the host's, `~/.ssh/authorized_keys` must not be
 //!   used: cloud-init would write through the mount into the host's real
 //!   `~/.ssh`. sshd is pointed at a root-owned key file in `/etc/ssh` instead.
 //! * The setup script runs from `bootcmd`, which cloud-init executes before it
@@ -38,14 +44,32 @@ pub struct Seed<'a> {
     pub instance_id: &'a str,
     pub user: &'a HostUser,
     pub ssh_public_key: &'a str,
-    /// Guest path of the user's home directory.
+    /// The user's home directory in the guest, `/home/<user>`.
     pub guest_home: &'a str,
-    /// Whether the host home is mounted at `guest_home`.
+    /// The host's home directory path. When shared it is mounted at this same
+    /// path in the guest; that mount is the guest home only if the two match.
+    pub host_home: &'a str,
+    /// Whether the host home is shared into the guest at all.
     pub share_home: bool,
     /// Packages to install on first boot (the audio stack).
     pub packages: &'a [&'a str],
     /// Command that installs sound kernel modules for the running kernel.
     pub kernel_modules_cmd: Option<&'a str>,
+}
+
+/// Escape a path for an fstab field, where whitespace separates fields.
+pub fn fstab_escape(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            ' ' => out.push_str("\\040"),
+            '\t' => out.push_str("\\011"),
+            '\n' => out.push_str("\\012"),
+            '\\' => out.push_str("\\134"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 const KERNEL_MODULES_SCRIPT: &str = "/usr/local/sbin/vmmbox-kernel-modules";
@@ -74,18 +98,26 @@ impl Seed<'_> {
             gid = self.user.gid,
         );
         if self.share_home {
+            let nine_p = format!(
+                "{HOME_TAG} {} 9p {MOUNT_OPTS} 0 0",
+                fstab_escape(self.host_home)
+            );
             s.push_str(&format!(
-                "home={home}\n\
+                "home={host}\n\
+                 changed=0\n\
                  mkdir -p \"$home\"\n\
                  if ! grep -qs '^{tag}[[:space:]]' /etc/fstab; then\n\
-                 \x20 echo \"{tag} $home 9p {opts} 0 0\" >> /etc/fstab\n\
-                 \x20 if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi\n\
-                 fi\n\
-                 mountpoint -q \"$home\" || mount \"$home\" || echo \"vmmbox: failed to mount the host home at $home\" >&2\n",
-                home = sh_quote(self.guest_home),
+                 \x20 printf '%s\\n' {nine_p} >> /etc/fstab\n\
+                 \x20 changed=1\n\
+                 fi\n",
+                host = sh_quote(self.host_home),
                 tag = HOME_TAG,
-                opts = MOUNT_OPTS,
+                nine_p = sh_quote(&nine_p),
             ));
+            s.push_str(
+                "if [ \"$changed\" = 1 ] && command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi\n\
+                 mountpoint -q \"$home\" || mount \"$home\" || echo \"vmmbox: failed to mount the host home at $home\" >&2\n",
+            );
         }
         s
     }
@@ -156,7 +188,9 @@ impl Seed<'_> {
             // JSON strings are valid YAML double-quoted scalars.
             gecos = serde_json::to_string(&self.user.full_name).unwrap_or_else(|_| "\"\"".into()),
         );
-        if self.share_home {
+        // The home is created by cloud-init like any other account's, unless the
+        // shared host home is mounted right at it.
+        if self.share_home && self.guest_home == self.host_home {
             y.push_str(&format!(
                 "    homedir: {}\n    no_create_home: true\n",
                 serde_json::to_string(self.guest_home).unwrap_or_default()
@@ -252,16 +286,19 @@ mod tests {
     }
 
     fn seed<'a>(u: &'a HostUser, share: bool) -> Seed<'a> {
+        seed_at(u, share, "/Users/ecurtin")
+    }
+
+    /// A seed whose host home is at `host_home` (the guest home is always
+    /// /home/ecurtin).
+    fn seed_at<'a>(u: &'a HostUser, share: bool, host_home: &'a str) -> Seed<'a> {
         Seed {
             hostname: "ubuntu",
             instance_id: "vmmbox-ubuntu-1",
             user: u,
             ssh_public_key: "ssh-ed25519 AAAAC3Nza vmmbox",
-            guest_home: if share {
-                "/Users/ecurtin"
-            } else {
-                "/home/ecurtin"
-            },
+            guest_home: "/home/ecurtin",
+            host_home,
             share_home: share,
             packages: &["pipewire", "wireplumber"],
             kernel_modules_cmd: Some("apt-get install -y \"linux-modules-extra-$(uname -r)\""),
@@ -269,21 +306,142 @@ mod tests {
     }
 
     #[test]
-    fn shared_home_user_data() {
+    fn host_home_elsewhere_leaves_the_guest_home_local() {
         let u = user();
-        let ud = seed(&u, true).user_data();
+        let ud = seed(&u, true).user_data(); // host home /Users/ecurtin
         assert!(ud.starts_with("#cloud-config\n"));
         assert!(ud.contains("  - name: ecurtin\n    uid: 501\n"));
         assert!(ud.contains("primary_group: ecurtin"));
-        assert!(ud.contains("homedir: \"/Users/ecurtin\""));
-        assert!(ud.contains("no_create_home: true"));
+        // cloud-init creates /home/ecurtin on the VM's disk like any account's
+        // home: no explicit homedir, and it must not skip creating it.
+        assert!(!ud.contains("homedir"), "{ud}");
+        assert!(!ud.contains("no_create_home"), "{ud}");
+        // The host home is shared at its own path; there is no bind mount.
+        assert!(!ud.contains("bind"), "{ud}");
         assert!(ud.contains("gid=20\n"));
         assert!(ud.contains("groupadd -o -g \"$gid\" \"$user\""));
-        assert!(ud.contains("vmmhome $home 9p trans=virtio,version=9p2000.L"));
         assert!(ud.contains("AuthorizedKeysFile /etc/ssh/vmmbox_authorized_keys"));
         assert!(ud.contains("      ssh-ed25519 AAAAC3Nza vmmbox\n"));
-        // The key must never go through the user's (shared) home directory.
+        // The key must never go through a (possibly shared) home directory.
         assert!(!ud.contains("ssh_authorized_keys"));
+    }
+
+    #[test]
+    fn host_home_at_home_user_is_the_guest_home() {
+        let u = user();
+        let ud = seed_at(&u, true, "/home/ecurtin").user_data();
+        // One direct mount, and cloud-init must not try to create the home.
+        assert!(ud.contains("homedir: \"/home/ecurtin\""), "{ud}");
+        assert!(ud.contains("no_create_home: true"), "{ud}");
+        assert!(!ud.contains("bind"), "{ud}");
+    }
+
+    #[test]
+    fn fstab_escaping() {
+        assert_eq!(fstab_escape("/Users/me"), "/Users/me");
+        assert_eq!(fstab_escape("/Users/John Smith"), "/Users/John\\040Smith");
+        assert_eq!(fstab_escape("/a\\b"), "/a\\134b");
+    }
+
+    /// Run the generated boot script in a real shell against a scratch fstab,
+    /// with the commands that need root stubbed out, twice (it runs on every
+    /// boot). Returns the resulting fstab and the log of stubbed calls.
+    fn run_boot_script(host_home: &str, tag: &str) -> (String, String) {
+        let u = user();
+        let script = seed_at(&u, true, host_home).setup_script();
+        let dir = std::env::temp_dir().join(format!("vmmbox-boot-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (fstab, log) = (dir.join("fstab"), dir.join("log"));
+        std::fs::write(&fstab, "UUID=1234 / ext4 defaults 0 1\n").unwrap();
+        std::fs::write(&log, "").unwrap();
+        let script = script.replace("/etc/fstab", &fstab.to_string_lossy());
+        let stubs = format!(
+            "L='{}'\n\
+             mkdir() {{ echo \"mkdir $*\" >> \"$L\"; }}\n\
+             mountpoint() {{ return 1; }}\n\
+             mount() {{ echo \"mount $*\" >> \"$L\"; }}\n\
+             systemctl() {{ echo \"systemctl $*\" >> \"$L\"; }}\n\
+             command() {{ return 0; }}\n\
+             getent() {{ return 0; }}\n\
+             groupadd() {{ :; }}\n\
+             groupmod() {{ :; }}\n",
+            log.display()
+        );
+        for _ in 0..2 {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{stubs}{script}"))
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let out = (
+            std::fs::read_to_string(&fstab).unwrap(),
+            std::fs::read_to_string(&log).unwrap(),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        out
+    }
+
+    fn count(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    #[test]
+    fn host_home_elsewhere_is_one_mount_at_its_own_path() {
+        let (fstab, log) = run_boot_script("/Users/ecurtin", "diff");
+        // Exactly the 9p share at the host path, written once though the script
+        // ran twice, with existing entries kept and nothing else added.
+        assert_eq!(
+            count(&fstab, "vmmhome /Users/ecurtin 9p trans=virtio"),
+            1,
+            "{fstab}"
+        );
+        assert!(!fstab.contains("bind"), "no bind mounts: {fstab}");
+        assert!(
+            !fstab.contains("/home/ecurtin"),
+            "guest home must stay local: {fstab}"
+        );
+        assert!(fstab.starts_with("UUID=1234 / ext4 defaults 0 1\n"));
+        assert_eq!(fstab.lines().count(), 2, "{fstab}");
+        // Only the host path is created and mounted; /home/<user> is left to
+        // cloud-init.
+        assert!(log.contains("mkdir -p /Users/ecurtin"), "{log}");
+        assert!(!log.contains("/home/ecurtin"), "{log}");
+        assert_eq!(
+            count(&log, "mount /Users/ecurtin"),
+            2,
+            "once per run: {log}"
+        );
+        // systemd is told about the new fstab once, on the run that changed it.
+        assert_eq!(count(&log, "systemctl daemon-reload"), 1, "{log}");
+    }
+
+    #[test]
+    fn host_home_at_home_user_is_a_single_direct_mount() {
+        let (fstab, log) = run_boot_script("/home/ecurtin", "same");
+        assert_eq!(count(&fstab, "vmmhome /home/ecurtin 9p"), 1, "{fstab}");
+        assert!(
+            !fstab.contains("bind"),
+            "no bind mount onto itself: {fstab}"
+        );
+        assert_eq!(fstab.lines().count(), 2, "{fstab}");
+        assert_eq!(count(&log, "mount /home/ecurtin"), 2, "{log}"); // once per run
+    }
+
+    #[test]
+    fn paths_with_spaces_are_escaped_in_fstab_but_not_in_commands() {
+        let (fstab, log) = run_boot_script("/Users/John Smith", "space");
+        assert!(
+            fstab.contains("vmmhome /Users/John\\040Smith 9p "),
+            "{fstab}"
+        );
+        // mount(8) takes the real path and decodes the fstab itself.
+        assert!(log.contains("mount /Users/John Smith"), "{log}");
+        // The fstab field count is intact: every vmmbox line has exactly 6 fields.
+        for line in fstab.lines().filter(|l| l.contains("/Users/")) {
+            assert_eq!(line.split_whitespace().count(), 6, "{line}");
+        }
     }
 
     #[test]

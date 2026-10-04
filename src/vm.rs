@@ -28,9 +28,11 @@ pub struct VmState {
     pub user: String,
     pub uid: u32,
     pub gid: u32,
-    /// The user's home directory inside the guest.
+    /// The user's home directory in the guest.
     pub guest_home: String,
-    /// The host home directory that is mounted at `guest_home`, if shared.
+    /// The host's home directory path. When shared it is mounted at this same
+    /// path in the guest. That mount is `guest_home` itself only if the two
+    /// match; otherwise `guest_home` is a plain directory on the VM's disk.
     pub host_home: String,
     pub home_shared: bool,
 
@@ -45,6 +47,14 @@ pub struct VmState {
     pub cpus: u32,
     #[serde(default)]
     pub memory_bytes: u64,
+}
+
+impl VmState {
+    /// Where the shared host home is mounted in the guest (its host path), or
+    /// `None` if the home is not shared.
+    pub fn shared_home_path(&self) -> Option<&str> {
+        self.home_shared.then_some(self.host_home.as_str())
+    }
 }
 
 pub struct Vm {
@@ -199,14 +209,15 @@ fn build(
     } else {
         true
     };
-    let guest_home = if home_shared {
-        user.home
-            .to_str()
-            .with_context(|| format!("home directory {} is not valid UTF-8", user.home.display()))?
-            .to_string()
-    } else {
-        format!("/home/{}", user.name)
-    };
+    // The account's home is /home/<user>, whatever the host's layout. The host
+    // home is shared at its own host path, and is the guest home only when that
+    // path is the same (see cloudinit.rs).
+    let guest_home = format!("/home/{}", user.name);
+    let host_home = user
+        .home
+        .to_str()
+        .with_context(|| format!("home directory {} is not valid UTF-8", user.home.display()))?
+        .to_string();
 
     let public_key = ssh::generate_keypair(dir)?;
 
@@ -232,6 +243,7 @@ fn build(
         user,
         ssh_public_key: &public_key,
         guest_home: &guest_home,
+        host_home: &host_home,
         share_home: home_shared,
         packages: &packages,
         kernel_modules_cmd: family.kernel_modules_cmd(),
@@ -249,7 +261,7 @@ fn build(
         uid: user.uid,
         gid: user.gid,
         guest_home,
-        host_home: user.home.to_string_lossy().into_owned(),
+        host_home,
         home_shared,
         pid: None,
         ssh_port: 0,

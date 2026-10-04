@@ -285,13 +285,12 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<(
         eprintln!("First boot: installing packages and configuring the guest...");
     }
     let _ = ssh.run_quiet("sudo -n timeout 300 cloud-init status --wait");
-    if vm.state.home_shared {
-        let probe = format!("mountpoint -q {}", sh_quote(&vm.state.guest_home));
+    if let Some(path) = vm.state.shared_home_path() {
+        let probe = format!("mountpoint -q {}", sh_quote(path));
         if ssh.run_quiet(&probe)? != 0 {
             eprintln!(
-                "warning: the host home is not mounted at {} in the guest; the guest kernel may \
-                 lack 9p support (see {})",
-                vm.state.guest_home,
+                "warning: the host home is not mounted at {path} in the guest; the guest kernel \
+                 may lack 9p support (see {})",
                 vm.console_log().display()
             );
         }
@@ -307,8 +306,13 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<(
     println!("  Memory: {}", format_bytes(s.memory_bytes));
     println!("  Disk:   {} (grows on demand)", format_bytes(s.disk_bytes));
     println!("  User:   {} (uid {}, gid {})", s.user, s.uid, s.gid);
-    if s.home_shared {
+    if s.home_shared && s.guest_home == s.host_home {
         println!("  Home:   {} (shared with the host)", s.guest_home);
+    } else if s.home_shared {
+        println!(
+            "  Home:   {} (on the VM); your host home is mounted at {}",
+            s.guest_home, s.host_home
+        );
     } else {
         println!("  Home:   {}", s.guest_home);
     }
