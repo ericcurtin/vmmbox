@@ -2,6 +2,7 @@
 name = "vmmbox"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-2.0-only"
 
 [dependencies]
 anyhow = "1.0.104"
