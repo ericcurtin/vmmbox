@@ -24,6 +24,12 @@ use std::time::{Duration, Instant};
 /// How long to wait for a freshly started compositor to open its socket.
 const COMPOSITOR_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Compression for the waypipe link, set explicitly on both ends. waypipe
+/// versions disagree about their default (0.8 and 0.11 reject each other's
+/// connection header over it), and the guest's version is whatever the distro
+/// ships.
+const COMPRESSION: &str = "lz4";
+
 /// Environment that steers common toolkits to Wayland. waypipe sets
 /// `WAYLAND_DISPLAY` itself; these cover apps that otherwise prefer X11.
 const GUEST_ENV: &[(&str, &str)] = &[
@@ -137,6 +143,7 @@ impl Gui {
         let _ = std::fs::remove_file(&host_sock);
 
         let mut client = Command::new(&self.waypipe)
+            .args(["--compress", COMPRESSION])
             .arg("--socket")
             .arg(&host_sock)
             .args(["--oneshot", "client"])
@@ -370,7 +377,7 @@ pub fn gui_script(cwd: Option<&str>, command: &[String], rc_file: &str) -> Strin
 pub fn gui_server_command(guest_socket: &str, script: &str, rc_file: &str) -> String {
     let rc = sh_quote(rc_file);
     format!(
-        "waypipe --no-gpu --unlink-socket --socket {} server -- sh -c {}; \
+        "waypipe --no-gpu --compress {COMPRESSION} --unlink-socket --socket {} server -- sh -c {}; \
          w=$?; rc=$(cat {rc} 2>/dev/null); rm -f {rc}; exit ${{rc:-$w}}",
         sh_quote(guest_socket),
         sh_quote(script),
@@ -538,7 +545,7 @@ mod script_tests {
         );
         let line = gui_server_command("/tmp/s.sock", &script, "/tmp/rc");
         assert!(line.starts_with(
-            "waypipe --no-gpu --unlink-socket --socket /tmp/s.sock server -- sh -c '"
+            "waypipe --no-gpu --compress lz4 --unlink-socket --socket /tmp/s.sock server -- sh -c '"
         ));
         // Parsed the way the guest's login shell would, the script is exactly
         // one word. A fake `waypipe` that prints its arguments shows that.
@@ -553,13 +560,13 @@ mod script_tests {
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(
             text.starts_with(
-                "<--no-gpu><--unlink-socket><--socket></tmp/s.sock><server><--><sh><-c><"
+                "<--no-gpu><--compress><lz4><--unlink-socket><--socket></tmp/s.sock><server><--><sh><-c><"
             ),
             "{text}"
         );
         assert_eq!(
             text.matches('<').count(),
-            9,
+            11,
             "script must be a single word: {text}"
         );
     }
