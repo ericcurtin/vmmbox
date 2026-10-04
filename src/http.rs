@@ -1,11 +1,9 @@
 //! HTTP downloads through the system `curl`, with checksumming and a terminal
 //! progress bar.
 //!
-//! vmmbox is GPL-2.0 licensed, which cannot be combined with the Apache-2.0
-//! code in the common Rust TLS stacks (`ring`, `aws-lc`, the `openssl` crate),
-//! so it links no TLS library at all. curl ships with macOS and Windows 10+,
-//! is on practically every Linux machine, and uses the operating system's own
-//! TLS and certificate store, so corporate root CAs and proxies just work.
+//! vmmbox links no TLS library. curl ships with macOS and Windows 10+, is on
+//! practically every Linux machine, and uses the operating system's own TLS
+//! and certificate store, so corporate root CAs and proxies just work.
 
 use crate::checksum::{Algo, Hasher};
 use crate::util::format_bytes;

@@ -7,7 +7,7 @@
 class Vmmbox < Formula
   desc "@DESCRIPTION@"
   homepage "https://github.com/@REPO@"
-  license "GPL-2.0-only"
+  license "Apache-2.0"
 
   # The hypervisor front end. vmmbox itself also needs ssh and curl: macOS ships
   # both, and Linux machines have them.

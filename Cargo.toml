@@ -2,7 +2,7 @@
 name = "vmmbox"
 version = "0.1.1"
 edition = "2024"
-license = "GPL-2.0-only"
+license = "Apache-2.0"
 description = "Accelerated Linux VMs on QEMU that mirror your user and share your home"
 repository = "https://github.com/ericcurtin/vmmbox"
 

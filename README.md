@@ -14,4 +14,4 @@ vmmbox run ubuntu bash    # pulls, creates and starts the VM as needed
 vmmbox ls                 # also: ps, images, pull, start, stop, rm, rmi
 ```
 
-GPL-2.0, see [LICENSE](LICENSE).
+Apache-2.0, see [LICENSE](LICENSE).

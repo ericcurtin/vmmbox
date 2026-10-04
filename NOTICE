@@ -1,0 +1,8 @@
+vmmbox
+Copyright 2026 Eric Curtin
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+QEMU (GPL-2.0), Cocoa-Way and waypipe (GPL-3.0 / MIT) are run as separate
+programs and are not part of vmmbox. Third-party code that is part of vmmbox
+is listed, with its license, in THIRD_PARTY_LICENSES.md.

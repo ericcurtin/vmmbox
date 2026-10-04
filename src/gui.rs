@@ -8,8 +8,8 @@
 //! * Linux: the user's own Wayland session.
 //! * Windows: not supported yet.
 //!
-//! Cocoa-Way and waypipe-darwin are GPL-3.0 and vmmbox is GPL-2.0-only, so they
-//! are only ever run as separate programs, never linked or bundled.
+//! Cocoa-Way and waypipe-darwin are GPL-3.0, so they are only ever run as
+//! separate programs, never linked or bundled.
 
 use crate::host::{Os, Platform};
 use crate::paths::Paths;
