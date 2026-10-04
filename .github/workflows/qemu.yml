@@ -1,0 +1,76 @@
+name: QEMU bundle
+
+# Builds vmmbox's own QEMU for macOS from the pinned upstream tarball (no
+# patches) and publishes it. Pushing a tag qemu-<version>-r<rev> publishes a
+# release with that name; the tag must match packaging/qemu/VERSION. Running it
+# by hand only builds and tests, and keeps the archives as workflow artifacts.
+#
+# After a release, run packaging/qemu/pin.sh and commit src/qemu_pins.rs: that
+# is what makes vmmbox install the bundle.
+
+on:
+  push:
+    tags: ["qemu-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Everything built here, and the Homebrew libraries bundled into it, must run
+  # on the macOS named as MIN_MACOS in packaging/qemu/VERSION; smoke-test.sh
+  # checks that they do.
+  MACOSX_DEPLOYMENT_TARGET: "15.0"
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: brew install glib pixman libslirp zstd ninja meson pkg-config
+      - name: Build, bundle and test
+        run: packaging/qemu/build.sh ${{ matrix.target }} --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qemu-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/qemu-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check the tag names this recipe
+        run: |
+          . packaging/qemu/VERSION
+          want="qemu-$QEMU_VERSION-r$BUNDLE_REV"
+          [ "$GITHUB_REF_NAME" = "$want" ] || { echo "tag $GITHUB_REF_NAME, but packaging/qemu/VERSION says $want" >&2; exit 1; }
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          . packaging/qemu/VERSION
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "QEMU $QEMU_VERSION for vmmbox (r$BUNDLE_REV)" \
+            --notes "Unmodified upstream QEMU $QEMU_VERSION (https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz), built with packaging/qemu/build.sh for macOS $MIN_MACOS or newer. vmmbox downloads these and checks them against SHA-256 values pinned in its source; run packaging/qemu/pin.sh to pin them."

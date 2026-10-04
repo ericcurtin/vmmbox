@@ -8,6 +8,8 @@
 pub const VERSION: &str = "11.0.5";
 /// Bundle revision: bumped when only the build recipe changes.
 pub const REV: u32 = 1;
+/// The oldest macOS major version the bundle runs on.
+pub const MIN_MACOS: u32 = 15;
 
 /// SHA-256 of each published archive, by target. A target with no entry has no
 /// bundle, and vmmbox uses the QEMU it finds on the system instead.

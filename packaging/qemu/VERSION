@@ -20,3 +20,8 @@ QEMU_URL=https://download.qemu.org/qemu-11.0.5.tar.xz
 # maintainer): "Good signature".
 QEMU_SHA256=38a1a09f349660cb0e20b8fe5f224d6a53ec4235eb36f2e33a31e21bb6138147
 BUNDLE_REV=1
+# The oldest macOS major version the bundle runs on: what the CI runner has.
+# Its binaries and the Homebrew libraries bundled into it are built for that
+# release, and smoke-test.sh checks that none needs anything newer. vmmbox
+# will not install the bundle on an older macOS.
+MIN_MACOS=15

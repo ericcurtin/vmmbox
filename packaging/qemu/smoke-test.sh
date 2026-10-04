@@ -21,10 +21,14 @@ target="$2"
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=VERSION
 . "$HERE/VERSION"
+# For checking the check itself on a machine newer than the floor.
+MIN_MACOS="${SMOKE_MIN_MACOS:-$MIN_MACOS}"
 
 case "$target" in
 aarch64-apple-darwin)
 	arch=aarch64 accel=hvf audio=coreaudio machine=virt firmware="edk2-aarch64-code.fd edk2-arm-vars.fd" ;;
+x86_64-apple-darwin)
+	arch=x86_64 accel=hvf audio=coreaudio machine=q35 firmware="bios-256k.bin kvmvapic.bin linuxboot_dma.bin" ;;
 *) die "unknown target: $target" ;;
 esac
 
@@ -78,6 +82,15 @@ ok "relocatable data directory"
 if [ "$(uname -s)" = Darwin ]; then
 	bad="$(otool -L "$qemu" "$img" "$root"/lib/*.dylib 2>/dev/null | awk '{print $1}' | grep -E '^(/opt/homebrew|/usr/local|/opt/local)/' || true)"
 	[ -z "$bad" ] || die "links outside the OS and the bundle: $bad"
+	# The floor in VERSION must be true: nothing in the bundle may need a newer macOS.
+	newest=0
+	for f in "$qemu" "$img" "$root"/lib/*.dylib; do
+		v="$(otool -l "$f" | awk '/LC_BUILD_VERSION/ {b=1} b && /minos/ {print $2; exit}')"
+		major="${v%%.*}"
+		[ -z "$major" ] || [ "$major" -le "$newest" ] || newest="$major"
+	done
+	[ "$newest" -le "$MIN_MACOS" ] || die "the bundle needs macOS $newest, but VERSION says $MIN_MACOS"
+	ok "needs macOS $newest or newer (VERSION says $MIN_MACOS)"
 	codesign --verify --strict "$qemu" || die "invalid signature on qemu-system"
 	codesign -d --entitlements - "$qemu" 2>/dev/null | grep -q com.apple.security.hypervisor || die "no Hypervisor entitlement"
 	ok "self-contained, signed, HVF entitlement"

@@ -33,9 +33,7 @@ pub fn setup() -> Result<()> {
     let platform = Platform::current()?;
     let paths = Paths::discover()?;
     if bundle::target_for(platform).is_none() {
-        println!(
-            "There is no vmmbox build of QEMU for this machine; the QEMU on your system is used."
-        );
+        println!("{}", bundle::why_none(platform));
         return Ok(());
     }
     match bundle::ensure(&paths, platform, &Http::new()?)? {

@@ -15,7 +15,7 @@ use crate::checksum::Algo;
 use crate::host::{Arch, Os, Platform};
 use crate::http::Http;
 use crate::paths::Paths;
-use crate::qemu_pins::{PINS, REV, VERSION};
+use crate::qemu_pins::{MIN_MACOS, PINS, REV, VERSION};
 use crate::tools::find_binary;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -57,10 +57,39 @@ fn pinned_sha(target: &str) -> Option<&'static str> {
     PINS.iter().find(|(t, _)| *t == target).map(|(_, h)| *h)
 }
 
-/// The bundle target for this host, if a bundle has been published and pinned.
+/// Whether this OS release can run the bundle: macOS bundles are built for a
+/// minimum release, and an unknown version is treated as too old.
+fn os_supported(os: Os, os_version: Option<&str>) -> bool {
+    match os {
+        Os::Mac => os_version
+            .and_then(|v| v.split('.').next())
+            .and_then(|major| major.parse::<u32>().ok())
+            .is_some_and(|major| major >= MIN_MACOS),
+        _ => true,
+    }
+}
+
+fn host_os_supported(platform: Platform) -> bool {
+    os_supported(platform.os, sysinfo::System::os_version().as_deref())
+}
+
+/// The bundle target for this host, if a bundle has been published and pinned
+/// and this machine can run it.
 pub fn target_for(platform: Platform) -> Option<&'static str> {
+    if !host_os_supported(platform) {
+        return None;
+    }
     let target = host_target(platform);
     pinned_sha(target).map(|_| target)
+}
+
+/// Why there is no bundle for this host, for `vmmbox setup` to say.
+pub fn why_none(platform: Platform) -> String {
+    if !host_os_supported(platform) {
+        format!("vmmbox's QEMU needs macOS {MIN_MACOS} or newer; the QEMU on your system is used")
+    } else {
+        "there is no vmmbox build of QEMU for this machine; the QEMU on your system is used".into()
+    }
 }
 
 fn archive_name(target: &str, version: &str, rev: u32) -> String {
@@ -272,6 +301,19 @@ fn remove_empty_parents(root: &Path, path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_must_be_new_enough_for_the_bundle() {
+        assert!(os_supported(Os::Mac, Some("15.0")));
+        assert!(os_supported(Os::Mac, Some("26.0.1")));
+        assert!(os_supported(Os::Mac, Some("15")));
+        assert!(!os_supported(Os::Mac, Some("14.7.1")));
+        // Not knowing is not good enough to install a binary that may not run.
+        assert!(!os_supported(Os::Mac, None));
+        assert!(!os_supported(Os::Mac, Some("sequoia")));
+        // Other systems have no such floor.
+        assert!(os_supported(Os::Linux, None));
+    }
 
     fn scratch(tag: &str) -> (Paths, PathBuf) {
         let root = std::env::temp_dir().join(format!("vmmbox-bundle-{tag}-{}", std::process::id()));
