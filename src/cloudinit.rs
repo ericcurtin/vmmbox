@@ -343,6 +343,7 @@ mod tests {
         assert_eq!(fstab_escape("/a\\b"), "/a\\134b");
     }
 
+    #[cfg(unix)]
     /// Run the generated boot script in a real shell against a scratch fstab,
     /// with the commands that need root stubbed out, twice (it runs on every
     /// boot). Returns the resulting fstab and the log of stubbed calls.
@@ -383,10 +384,14 @@ mod tests {
         out
     }
 
+    #[cfg(unix)]
     fn count(haystack: &str, needle: &str) -> usize {
         haystack.matches(needle).count()
     }
 
+    // These run the guest's boot script through the host's `sh` with unix-style
+    // paths; the script itself only ever runs in a Linux guest.
+    #[cfg(unix)]
     #[test]
     fn host_home_elsewhere_is_one_mount_at_its_own_path() {
         let (fstab, log) = run_boot_script("/Users/ecurtin", "diff");
@@ -417,6 +422,7 @@ mod tests {
         assert_eq!(count(&log, "systemctl daemon-reload"), 1, "{log}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn host_home_at_home_user_is_a_single_direct_mount() {
         let (fstab, log) = run_boot_script("/home/ecurtin", "same");
@@ -429,6 +435,7 @@ mod tests {
         assert_eq!(count(&log, "mount /home/ecurtin"), 2, "{log}"); // once per run
     }
 
+    #[cfg(unix)]
     #[test]
     fn paths_with_spaces_are_escaped_in_fstab_but_not_in_commands() {
         let (fstab, log) = run_boot_script("/Users/John Smith", "space");
