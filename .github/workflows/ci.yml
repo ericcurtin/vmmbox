@@ -139,6 +139,85 @@ jobs:
           path: dist/${{ matrix.asset }}
           if-no-files-found: error
 
+  # Runs each binary that will be released, booting a real VM where the runner
+  # can host one. Probing GitHub's runners found a hypervisor on only two:
+  # ubuntu-24.04 (KVM, once a udev rule opens /dev/kvm) and windows-latest
+  # (WHPX). ubuntu-24.04-arm has no /dev/kvm, macos-latest reports
+  # kern.hv_support 0, and windows-11-arm has WHPX off (enabling it needs a
+  # reboot). Those `nohw` legs pull the image and check that `start` fails with
+  # a clear error, and warn if a runner can boot after all. See ci/e2e.sh.
+  e2e:
+    name: E2E ${{ matrix.target }} (${{ matrix.mode }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, mode: boot}
+          - {target: x86_64-pc-windows-msvc, runner: windows-latest, mode: boot}
+          - {target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, mode: nohw}
+          - {target: aarch64-apple-darwin, runner: macos-latest, mode: nohw}
+          - {target: aarch64-pc-windows-msvc, runner: windows-11-arm, mode: nohw}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+
+      # The runner gives /dev/kvm to root and the kvm group only.
+      - name: Enable KVM
+        if: runner.os == 'Linux' && matrix.mode == 'boot'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # Homebrew's, as the formula installs them: Ubuntu 24.04's apt virtiofsd
+      # (1.10) lacks --translate-uid, which vmmbox passes.
+      - name: Install QEMU and virtiofsd
+        if: runner.os == 'Linux' && matrix.mode == 'boot'
+        run: |
+          /home/linuxbrew/.linuxbrew/bin/brew install qemu virtiofsd
+          echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
+
+      # The upstream installer that Scoop's qemu package uses.
+      - name: Install QEMU
+        if: runner.os == 'Windows' && matrix.mode == 'boot'
+        run: choco install qemu --no-progress -y
+
+      # Capped, so a hung guest fails with logs instead of at the job limit.
+      - name: End-to-end test
+        timeout-minutes: 25
+        shell: bash
+        run: ci/e2e.sh "${{ matrix.mode }}" dist/* "${{ matrix.target }}"
+
+      # The script prints these itself unless the step was killed.
+      - name: Show the VM logs
+        if: failure() || cancelled()
+        shell: bash
+        run: |
+          [ -e "$RUNNER_TEMP/vmmbox-e2e/.diagnosed" ] && exit 0
+          find "$RUNNER_TEMP/vmmbox-e2e" -name '*.log' | while IFS= read -r log; do
+            printf '\n---- %s (last 80 lines)\n' "$log"
+            tail -n 80 "$log" || true
+          done
+          if [ "$RUNNER_OS" = Windows ]; then tasklist | grep -i -E 'qemu|vmmbox|ssh' || true
+          else pgrep -fa 'qemu|vmmbox|virtiofsd' || true; fi
+
+      - name: Keep the VM logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-logs-${{ matrix.target }}
+          path: ${{ runner.temp }}/vmmbox-e2e/**/*.log
+          if-no-files-found: ignore
+
   packaging:
     name: Packaging
     runs-on: ubuntu-24.04
@@ -247,7 +326,7 @@ jobs:
   release:
     name: Publish release
     # Everything must be green first.
-    needs: [tag, test, build, packaging]
+    needs: [tag, test, build, e2e, packaging]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
     permissions:

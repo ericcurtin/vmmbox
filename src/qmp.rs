@@ -1,28 +1,29 @@
 //! A minimal QMP (QEMU Machine Protocol) client, used for graceful shutdown.
 //!
-//! The control channel is a Unix domain socket in a private directory on
-//! macOS/Linux and a named pipe on Windows. Neither is reachable by other
-//! users, unlike a loopback TCP port.
+//! The channel is a Unix socket in a private directory on macOS and Linux. On
+//! Windows there is none: QEMU's pipe chardev blocks at start-up until a client
+//! connects and serves only that one, so a VM is stopped through the guest
+//! instead (see `Ssh::power_off`).
 
 use crate::paths::Paths;
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::mpsc;
+use anyhow::{Result, bail};
 use std::time::Duration;
+#[cfg(unix)]
+use {
+    anyhow::Context,
+    serde_json::{Value, json},
+    std::io::{BufRead, BufReader, Read, Write},
+    std::sync::mpsc,
+};
 
 #[derive(Clone, Debug)]
 pub enum Endpoint {
     #[cfg(unix)]
     Unix(std::path::PathBuf),
-    #[cfg(windows)]
-    Pipe(String),
+    /// No control channel: QEMU is not given one.
+    #[cfg_attr(unix, allow(dead_code))] // Windows uses it; unix tests do too
+    Unavailable,
 }
-
-#[cfg(unix)]
-type Conn = std::os::unix::net::UnixStream;
-#[cfg(windows)]
-type Conn = std::fs::File;
 
 impl Endpoint {
     #[cfg(unix)]
@@ -33,62 +34,65 @@ impl Endpoint {
     }
 
     #[cfg(windows)]
-    pub fn for_vm(_paths: &Paths, name: &str) -> Result<Self> {
-        // Pipe names are machine-global, so include the user.
-        let user = std::env::var("USERNAME").unwrap_or_default();
-        Ok(Endpoint::Pipe(format!("vmmbox-{user}-{name}")))
+    pub fn for_vm(_paths: &Paths, _name: &str) -> Result<Self> {
+        Ok(Endpoint::Unavailable)
     }
 
-    /// The QEMU `-chardev` specification (with id `qmp`) for this endpoint.
-    pub fn chardev(&self) -> String {
+    /// Whether QEMU gets a control channel for this endpoint.
+    pub fn available(&self) -> bool {
+        !matches!(self, Endpoint::Unavailable)
+    }
+
+    /// The QEMU `-chardev` specification (with id `qmp`) for this endpoint, or
+    /// `None` if QEMU is to have no control channel.
+    pub fn chardev(&self) -> Option<String> {
         match self {
             #[cfg(unix)]
-            Endpoint::Unix(p) => format!(
+            Endpoint::Unix(p) => Some(format!(
                 "socket,id=qmp,path={},server=on,wait=off",
                 crate::qemu::escape(&p.to_string_lossy())
-            ),
-            // QEMU prefixes `\\.\pipe\` itself on Windows.
-            #[cfg(windows)]
-            Endpoint::Pipe(name) => format!("pipe,id=qmp,path={name}"),
+            )),
+            Endpoint::Unavailable => None,
         }
     }
 
     /// Remove any stale socket left by a previous crashed run.
     pub fn cleanup(&self) {
         #[cfg(unix)]
-        {
-            let Endpoint::Unix(p) = self;
+        if let Endpoint::Unix(p) = self {
             let _ = std::fs::remove_file(p);
         }
     }
 
-    fn connect(&self) -> std::io::Result<Conn> {
+    #[cfg(unix)]
+    fn connect(&self) -> std::io::Result<std::os::unix::net::UnixStream> {
         match self {
-            #[cfg(unix)]
             Endpoint::Unix(p) => std::os::unix::net::UnixStream::connect(p),
-            #[cfg(windows)]
-            Endpoint::Pipe(name) => std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(format!(r"\\.\pipe\{name}")),
+            Endpoint::Unavailable => Err(std::io::ErrorKind::Unsupported.into()),
         }
     }
 
     /// Run one QMP command, giving up after `timeout`. The exchange runs on its
-    /// own thread because pipes have no portable read timeout.
+    /// own thread so that a QEMU that never answers cannot hold us up.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     pub fn execute(&self, command: &str, timeout: Duration) -> Result<()> {
-        let endpoint = self.clone();
-        let command = command.to_string();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(endpoint.exchange(&command));
-        });
-        match rx.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(_) => bail!("timed out waiting for QEMU to answer"),
+        #[cfg(unix)]
+        if self.available() {
+            let endpoint = self.clone();
+            let command = command.to_string();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(endpoint.exchange(&command));
+            });
+            return match rx.recv_timeout(timeout) {
+                Ok(result) => result,
+                Err(_) => bail!("timed out waiting for QEMU to answer"),
+            };
         }
+        bail!("this VM has no QEMU control channel")
     }
 
+    #[cfg(unix)]
     fn exchange(&self, command: &str) -> Result<()> {
         let conn = self
             .connect()
@@ -105,6 +109,7 @@ impl Endpoint {
     }
 }
 
+#[cfg(unix)]
 fn send<S: Read + Write>(conn: &mut BufReader<S>, command: &str) -> Result<()> {
     let msg = json!({ "execute": command }).to_string() + "\n";
     let stream = conn.get_mut();
@@ -113,6 +118,7 @@ fn send<S: Read + Write>(conn: &mut BufReader<S>, command: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 /// Read one JSON message; `None` on EOF.
 fn read_message<R: Read>(r: &mut BufReader<R>) -> Result<Option<Value>> {
     let mut line = String::new();
@@ -130,6 +136,7 @@ fn read_message<R: Read>(r: &mut BufReader<R>) -> Result<Option<Value>> {
     }
 }
 
+#[cfg(unix)]
 /// Read until a command reply, skipping asynchronous events.
 /// Returns `None` if the channel closed first.
 fn read_reply<R: Read>(r: &mut BufReader<R>) -> Result<Option<Value>> {

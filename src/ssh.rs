@@ -7,10 +7,28 @@
 use crate::vm::Vm;
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
+/// Where to look for ssh tools, best first. On Windows that is the system's own
+/// OpenSSH, which vmmbox's arguments are written for, before `PATH`: Git for
+/// Windows' MSYS ssh, often ahead of it there, mis-parses them.
+fn tool_dirs(windows: bool, path: Option<OsString>, system_root: Option<OsString>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if windows {
+        // The optional "OpenSSH Client" feature installs here.
+        let root = system_root.unwrap_or_else(|| r"C:\Windows".into());
+        dirs.push(PathBuf::from(root).join("System32").join("OpenSSH"));
+    }
+    if let Some(path) = path {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs
+}
 
 fn find_tool(name: &str) -> Result<PathBuf> {
     let file = if cfg!(windows) {
@@ -18,14 +36,11 @@ fn find_tool(name: &str) -> Result<PathBuf> {
     } else {
         name.to_string()
     };
-    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    if cfg!(windows) {
-        // The optional "OpenSSH Client" feature installs here.
-        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-        dirs.push(PathBuf::from(root).join("System32").join("OpenSSH"));
-    }
+    let dirs = tool_dirs(
+        cfg!(windows),
+        std::env::var_os("PATH"),
+        std::env::var_os("SystemRoot"),
+    );
     dirs.iter()
         .map(|d| d.join(&file))
         .find(|p| p.is_file())
@@ -133,16 +148,18 @@ impl Ssh {
 
     /// Whether the guest accepts our key right now.
     pub fn probe(&self) -> bool {
-        self.command()
-            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
-            .arg(self.target())
-            .arg("true")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        self.probe_detail().is_ok()
+    }
+
+    /// Like `probe`, but says what ssh complained about if the guest does not
+    /// accept us, for the error shown when a VM never becomes reachable.
+    pub fn probe_detail(&self) -> std::result::Result<(), String> {
+        match self.run_capped("true", 5, Duration::from_secs(20)) {
+            Ok((0, _)) => Ok(()),
+            Ok((_, said)) if !said.is_empty() => Err(said),
+            Ok((code, _)) => Err(format!("ssh exited with status {code}")),
+            Err(e) => Err(format!("{e:#}")),
+        }
     }
 
     /// Run a non-interactive command and return its exit code.
@@ -158,6 +175,64 @@ impl Ssh {
             .status()
             .context("running ssh")?;
         Ok(exit_code(status))
+    }
+
+    /// Ask the guest to power itself off: how a VM with no QEMU control channel
+    /// (Windows) is stopped. `--no-block` makes systemd answer at once, so a
+    /// request that was accepted is an exit status of 0.
+    pub fn power_off(&self, limit: Duration) -> Result<()> {
+        let (code, said) = self.run_capped("sudo -n systemctl poweroff --no-block", 10, limit)?;
+        let detail = if said.is_empty() {
+            String::new()
+        } else {
+            format!(": {said}")
+        };
+        match code {
+            0 => Ok(()),
+            255 => bail!("could not reach the guest over SSH{detail}"),
+            _ => {
+                bail!("the guest did not accept the power-off request (exit status {code}){detail}")
+            }
+        }
+    }
+
+    /// Run `remote` without a terminal and return its exit code and stderr,
+    /// killing ssh if it takes longer than `limit`.
+    fn run_capped(
+        &self,
+        remote: &str,
+        connect_timeout: u32,
+        limit: Duration,
+    ) -> Result<(i32, String)> {
+        let mut child = self
+            .command()
+            .args(["-o", "BatchMode=yes", "-o"])
+            .arg(format!("ConnectTimeout={connect_timeout}"))
+            .arg(self.target())
+            .arg(remote)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("running ssh")?;
+        let deadline = Instant::now() + limit;
+        let status = loop {
+            if let Some(status) = child.try_wait().context("waiting for ssh")? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("timed out waiting for ssh");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        // ssh has exited, so all it wrote is in the pipe already.
+        let mut said = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut said);
+        }
+        Ok((exit_code(status), said.trim().to_string()))
     }
 
     /// Run `remote` attached to this terminal and return its exit code.
@@ -184,4 +259,129 @@ pub fn exit_code(status: std::process::ExitStatus) -> i32 {
         }
     }
     status.code().unwrap_or(255)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// An `Ssh` whose "ssh" is the shell script `body`, which gets ssh's real
+    /// arguments, so what vmmbox runs on the guest can be checked.
+    fn fake(tag: &str, body: &str) -> (Ssh, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("vmmbox-ssh-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("ssh");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ssh = Ssh {
+            ssh: script,
+            key: dir.join("key"),
+            known_hosts: dir.join("known_hosts"),
+            port: 2222,
+            user: "me".into(),
+        };
+        (ssh, dir)
+    }
+
+    #[test]
+    fn windows_prefers_its_own_openssh_over_one_on_the_path() {
+        let path = Some(std::env::join_paths(["/git/usr/bin", "/other"]).unwrap());
+        let dirs = tool_dirs(true, path.clone(), Some(r"D:\Win".into()));
+        assert_eq!(
+            dirs[0],
+            PathBuf::from(r"D:\Win").join("System32").join("OpenSSH")
+        );
+        assert_eq!(
+            &dirs[1..],
+            [PathBuf::from("/git/usr/bin"), PathBuf::from("/other")]
+        );
+        // Without SystemRoot, the usual place.
+        let dirs = tool_dirs(true, None, None);
+        assert_eq!(
+            dirs,
+            [PathBuf::from(r"C:\Windows")
+                .join("System32")
+                .join("OpenSSH")]
+        );
+    }
+
+    #[test]
+    fn elsewhere_only_the_path_is_searched() {
+        let path = Some(std::env::join_paths(["/usr/bin", "/usr/local/bin"]).unwrap());
+        let dirs = tool_dirs(false, path, Some("ignored".into()));
+        assert_eq!(
+            dirs,
+            [PathBuf::from("/usr/bin"), PathBuf::from("/usr/local/bin")]
+        );
+        assert!(tool_dirs(false, None, None).is_empty());
+    }
+
+    #[test]
+    fn a_failed_probe_says_what_ssh_complained_about() {
+        let (ssh, dir) = fake(
+            "probe",
+            "echo 'Permission denied (publickey).' >&2; exit 255",
+        );
+        assert!(!ssh.probe());
+        assert_eq!(
+            ssh.probe_detail().unwrap_err(),
+            "Permission denied (publickey)."
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_probe_that_succeeds_has_nothing_to_report() {
+        let (ssh, dir) = fake("probe-ok", "exit 0");
+        assert!(ssh.probe());
+        assert!(ssh.probe_detail().is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn power_off_asks_the_guest_to_power_off() {
+        let (ssh, dir) = fake("ok", r#"printf '%s\n' "$@" > "$(dirname "$0")/args""#);
+        ssh.power_off(Duration::from_secs(10)).unwrap();
+        let args = std::fs::read_to_string(dir.join("args")).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert!(args.contains(&"BatchMode=yes"), "{args:?}");
+        assert!(args.contains(&"me@127.0.0.1"), "{args:?}");
+        // `sudo -n`: never wait for a password.
+        assert_eq!(
+            args.last().copied(),
+            Some("sudo -n systemctl poweroff --no-block")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn power_off_reports_an_unreachable_guest() {
+        let (ssh, dir) = fake("down", "echo 'Connection refused' >&2; exit 255");
+        let err = ssh.power_off(Duration::from_secs(10)).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("could not reach the guest"), "{err}");
+        assert!(err.contains("Connection refused"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn power_off_reports_a_refusal() {
+        let (ssh, dir) = fake("sudo", "echo 'sudo: a password is required' >&2; exit 1");
+        let err = format!("{:#}", ssh.power_off(Duration::from_secs(10)).unwrap_err());
+        assert!(err.contains("did not accept"), "{err}");
+        assert!(err.contains("a password is required"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A guest that stops answering must not hang `vmmbox stop`.
+    #[test]
+    fn power_off_gives_up_on_a_wedged_guest() {
+        let (ssh, dir) = fake("hang", "sleep 30");
+        let started = Instant::now();
+        let err = ssh.power_off(Duration::from_millis(400)).unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
