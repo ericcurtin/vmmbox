@@ -84,7 +84,6 @@ cleanup() {
 	local status=$?
 	if [ "$status" -ne 0 ]; then
 		touch "$scratch/.diagnosed" # tells the workflow not to repeat this
-		[ -z "${E2E_KNOWN_ISSUE:-}" ] || printf '::warning::Known issue: %s\n' "$E2E_KNOWN_ISSUE"
 		printf '\n==== FAILED (exit %s): diagnostics ====\n' "$status"
 		"$vmmbox" ps -a 2>&1 || true
 		while IFS= read -r log; do

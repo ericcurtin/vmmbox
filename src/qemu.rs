@@ -609,8 +609,11 @@ pub fn build_args(l: &Launch) -> Result<Vec<String>> {
     );
     a.kv("-serial", "chardev:console".into());
 
-    a.kv("-chardev", l.qmp.chardev());
-    a.kv("-qmp", "chardev:qmp".into());
+    // The control channel, where there is one (not on Windows: see qmp.rs).
+    if let Some(chardev) = l.qmp.chardev() {
+        a.kv("-chardev", chardev);
+        a.kv("-qmp", "chardev:qmp".into());
+    }
 
     Ok(a.0)
 }
@@ -878,14 +881,47 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn whpx_args() {
-        let ep = Endpoint::Unix("/tmp/s.sock".into());
         let platform = Platform {
             os: Os::Windows,
             arch: Arch::X86_64,
         };
-        let args = build_args(&launch(platform, &ep, None)).unwrap();
+        let args = build_args(&launch(platform, &Endpoint::Unavailable, None)).unwrap();
         assert!(has_pair(&args, "-accel", "whpx,kernel-irqchip=off"));
         assert!(has_pair(&args, "-cpu", "max"));
+    }
+
+    /// QEMU on Windows blocks at start-up on a `-chardev pipe` until something
+    /// connects to it, so it must be given no control channel at all.
+    #[cfg(unix)]
+    #[test]
+    fn no_control_channel_means_no_qmp_arguments() {
+        let platform = Platform {
+            os: Os::Windows,
+            arch: Arch::X86_64,
+        };
+        let args = build_args(&launch(platform, &Endpoint::Unavailable, None)).unwrap();
+        assert!(!args.iter().any(|a| a == "-qmp"));
+        assert!(!args.iter().any(|a| a.contains("id=qmp")));
+        assert!(!args.iter().any(|a| a.starts_with("pipe,")));
+        // The rest of the machine is still there.
+        assert!(has_pair(&args, "-accel", "whpx,kernel-irqchip=off"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_socket_endpoint_gets_the_control_channel() {
+        let ep = Endpoint::Unix("/tmp/vmmbox-501/ubuntu.sock".into());
+        let platform = Platform {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        };
+        let args = build_args(&launch(platform, &ep, None)).unwrap();
+        assert!(has_pair(&args, "-qmp", "chardev:qmp"));
+        assert!(has_pair(
+            &args,
+            "-chardev",
+            "socket,id=qmp,path=/tmp/vmmbox-501/ubuntu.sock,server=on,wait=off"
+        ));
     }
 
     #[cfg(unix)]

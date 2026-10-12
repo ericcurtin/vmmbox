@@ -557,6 +557,17 @@ fn wait_exit(pid: u32, timeout: Duration) -> bool {
     !crate::proc::is_qemu(pid)
 }
 
+/// Ask the guest to shut down: by pressing its ACPI power button through QEMU's
+/// control channel where there is one, and otherwise (Windows) by asking the
+/// guest to power itself off over SSH.
+fn request_shutdown(vm: &Vm, endpoint: &Endpoint) -> Result<()> {
+    if endpoint.available() {
+        endpoint.execute("system_powerdown", Duration::from_secs(10))
+    } else {
+        Ssh::for_vm(vm)?.power_off(Duration::from_secs(20))
+    }
+}
+
 /// Shut a VM down, gracefully if the guest cooperates. Returns whether it was
 /// running.
 fn stop_vm(paths: &Paths, vm: &mut Vm) -> Result<bool> {
@@ -572,8 +583,8 @@ fn stop_vm(paths: &Paths, vm: &mut Vm) -> Result<bool> {
 
     let endpoint = Endpoint::for_vm(paths, &name)?;
     eprintln!("Stopping {name}...");
-    // Ask politely first (ACPI power button) so the guest unmounts and syncs.
-    let graceful = match endpoint.execute("system_powerdown", Duration::from_secs(10)) {
+    // Ask politely first so the guest unmounts and syncs.
+    let graceful = match request_shutdown(vm, &endpoint) {
         Ok(()) => wait_exit(pid, SHUTDOWN_TIMEOUT),
         Err(e) => {
             eprintln!("warning: could not ask the guest to shut down: {e:#}");

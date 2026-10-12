@@ -153,15 +153,11 @@ jobs:
   # `nohw` (the runners with no hypervisor) pulls the image for that architecture
   # and checks that `start` refuses with a clear error; it warns if a runner turns
   # out to be able to boot, so the platform can be moved to `boot`. See ci/e2e.sh.
-  #
-  # Windows x64 is a `boot` test that fails today, and is therefore not allowed to
-  # block a release (known_broken): see its entry below.
   e2e:
     name: E2E ${{ matrix.target }} (${{ matrix.mode }})
     needs: build
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
-    continue-on-error: ${{ matrix.known_broken == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -172,21 +168,12 @@ jobs:
             arch: x86_64
             accel: kvm
             mode: boot
-          # WHPX works on this runner (QEMU boots Ubuntu to a login prompt in
-          # under a minute), but vmmbox cannot start a VM on Windows: it gives
-          # QEMU a `-chardev pipe` for QMP, and QEMU's Windows pipe chardev blocks
-          # at start-up until a client connects (chardev/char-pipe.c,
-          # win_chr_pipe_init) and serves only that one client. vmmbox connects
-          # only to stop the VM, so the guest never runs, and a stop could not
-          # work either. Remove known_broken when that is fixed.
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             asset: vmmbox-x86_64-pc-windows-msvc.exe
             arch: x86_64
             accel: whpx
             mode: boot
-            known_broken: true
-            known_issue: "vmmbox cannot start VMs on Windows: QEMU blocks on the QMP pipe until a client connects. See the comment on this job in ci.yml."
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
             asset: vmmbox-aarch64-unknown-linux-musl
@@ -258,7 +245,6 @@ jobs:
         shell: bash
         env:
           E2E_EXPECT_ERROR: ${{ matrix.expect }}
-          E2E_KNOWN_ISSUE: ${{ matrix.known_issue }}
         run: ci/e2e.sh "${{ matrix.mode }}" "dist/${{ matrix.asset }}" "${{ matrix.arch }}" "${{ matrix.accel }}"
 
       # The script prints these itself when a check fails. It cannot when the
