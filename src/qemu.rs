@@ -49,13 +49,32 @@ fn install_hint(os: Os, arch: Arch) -> String {
     match os {
         Os::Mac => "brew install qemu".into(),
         Os::Linux => match arch {
-            Arch::X86_64 => "install QEMU, e.g. `sudo apt install qemu-system-x86 qemu-utils` \
-                             or `sudo dnf install qemu-system-x86-core qemu-img`"
+            Arch::X86_64 => "install QEMU, e.g. `sudo apt install qemu-system-x86 qemu-utils`, \
+                             `sudo dnf install qemu-system-x86-core qemu-img` (Fedora) or \
+                             `sudo dnf install qemu-kvm` (RHEL family)"
                 .into(),
-            Arch::Aarch64 => "install qemu-system-aarch64 and qemu-img".into(),
+            Arch::Aarch64 => {
+                "install qemu-system-aarch64 and qemu-img (RHEL family: qemu-kvm)".into()
+            }
         },
         Os::Windows => "winget install SoftwareFreedomConservancy.QEMU".into(),
     }
+}
+
+/// What the emulator is called, best name first. RHEL-family distros install it
+/// only as `/usr/libexec/qemu-kvm`.
+fn system_names(os: Os, arch: Arch) -> Vec<String> {
+    let mut names = vec![format!("qemu-system-{}", arch.as_str())];
+    if os == Os::Linux {
+        names.push("qemu-kvm".into());
+    }
+    names
+}
+
+/// The first of `names` found, trying every directory for one name before the
+/// next, so `qemu-system-*` anywhere beats `qemu-kvm`.
+fn find_first(names: &[String], own: &[PathBuf], extra: &[PathBuf]) -> Option<PathBuf> {
+    names.iter().find_map(|n| find_binary(n, own, extra))
 }
 
 pub struct Qemu {
@@ -217,10 +236,11 @@ impl Qemu {
     pub fn locate(platform: Platform, paths: &Paths) -> Result<Self> {
         let own = [paths.bin()];
         let extra = well_known_dirs(platform.os);
-        let sys_name = format!("qemu-system-{}", platform.arch.as_str());
-        let system = find_binary(&sys_name, &own, &extra).with_context(|| {
+        let names = system_names(platform.os, platform.arch);
+        let system = find_first(&names, &own, &extra).with_context(|| {
             format!(
-                "{sys_name} not found on PATH. Install QEMU: {}",
+                "{} not found on PATH. Install QEMU: {}",
+                names[0],
                 install_hint(platform.os, platform.arch)
             )
         })?;
@@ -1118,5 +1138,49 @@ mod gpu_tests {
         );
         assert_eq!(parse_kernel(""), None);
         assert_eq!(parse_kernel("garbage"), None);
+    }
+}
+
+#[cfg(test)]
+mod locate_tests {
+    use super::*;
+
+    #[test]
+    fn only_linux_falls_back_to_qemu_kvm() {
+        assert_eq!(
+            system_names(Os::Linux, Arch::Aarch64),
+            ["qemu-system-aarch64", "qemu-kvm"]
+        );
+        assert_eq!(
+            system_names(Os::Mac, Arch::Aarch64),
+            ["qemu-system-aarch64"]
+        );
+        assert_eq!(
+            system_names(Os::Windows, Arch::X86_64),
+            ["qemu-system-x86_64"]
+        );
+    }
+
+    #[test]
+    fn the_first_name_wins_anywhere_and_the_next_is_the_fallback() {
+        let root = std::env::temp_dir().join(format!("vmmbox-qemu-find-{}", std::process::id()));
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let names = [
+            "vmmbox-test-system".to_string(),
+            "vmmbox-test-kvm".to_string(),
+        ];
+        let (system, kvm) = (exe_name(&names[0]), exe_name(&names[1]));
+        let (own, extra) = (std::slice::from_ref(&a), std::slice::from_ref(&b));
+
+        // Only the fallback exists.
+        std::fs::write(b.join(&kvm), b"").unwrap();
+        assert_eq!(find_first(&names, &[], extra), Some(b.join(&kvm)));
+        // The preferred name wins even in a later directory.
+        std::fs::write(a.join(&kvm), b"").unwrap();
+        std::fs::write(b.join(&system), b"").unwrap();
+        assert_eq!(find_first(&names, own, extra), Some(b.join(&system)));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

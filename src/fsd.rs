@@ -51,8 +51,9 @@ pub fn install_hint(os: Os) -> &'static str {
     match os {
         Os::Mac => "run `vmmbox setup` to install the QEMU vmmbox ships",
         Os::Linux => {
-            "install virtiofsd (Fedora: `dnf install virtiofsd`; Debian and Ubuntu: \
-             `apt install virtiofsd`) and a QEMU that has vhost-user-fs"
+            "install virtiofsd, ideally 1.13 or newer (`dnf install virtiofsd` on Fedora and \
+             the RHEL family, `apt install virtiofsd` on Debian and Ubuntu), and a QEMU that \
+             has vhost-user-fs"
         }
         Os::Windows => "this is not supported on Windows",
     }
@@ -68,7 +69,27 @@ fn server_command(root: &Path, socket: &Path, os: Os) -> Result<std::process::Co
         let bin = find_virtiofsd().context("virtiofsd is not installed")?;
         // SAFETY: getuid and getgid have no preconditions.
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-        return Ok(virtiofsd_command(&bin, root, socket, uid, gid));
+        let translate_ids = supports_id_translation(&bin);
+        if !translate_ids {
+            // Once: the server restarts when QEMU does without sound or the GPU.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "warning: {} cannot translate guest user ids (that needs virtiofsd 1.13 \
+                     or newer): your own user can use the shared home, but files written by \
+                     other guest users, root included, may fail",
+                    bin.display()
+                );
+            });
+        }
+        return Ok(virtiofsd_command(
+            &bin,
+            root,
+            socket,
+            uid,
+            gid,
+            translate_ids,
+        ));
     }
     let mut cmd = Command::new(std::env::current_exe().context("finding vmmbox itself")?);
     cmd.arg("virtiofsd")
@@ -82,6 +103,17 @@ fn server_command(root: &Path, socket: &Path, os: Os) -> Result<std::process::Co
     Ok(cmd)
 }
 
+/// Whether this `virtiofsd` has `--translate-uid`, added in 1.13.0 (Ubuntu 24.04
+/// ships 1.10).
+#[cfg(unix)]
+fn supports_id_translation(bin: &Path) -> bool {
+    std::process::Command::new(bin)
+        .arg("--help")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("--translate-uid"))
+}
+
 /// The standard `virtiofsd`, run unprivileged as `uid`:`gid`.
 #[cfg(unix)]
 fn virtiofsd_command(
@@ -90,28 +122,29 @@ fn virtiofsd_command(
     socket: &Path,
     uid: u32,
     gid: u32,
+    translate_ids: bool,
 ) -> std::process::Command {
-    {
-        let mut cmd = std::process::Command::new(bin);
-        cmd.arg("--socket-path")
-            .arg(socket)
-            .arg("--shared-dir")
-            .arg(root)
-            .args(["--cache", "auto", "--announce-submounts"])
-            // Not the default namespace sandbox: that maps the user to root
-            // inside it, and it is unavailable where unprivileged user
-            // namespaces are restricted (Ubuntu 24.04, containers).
-            .args(["--sandbox", "none"])
-            // Unprivileged, virtiofsd cannot give files any owner but its own,
-            // so a guest user other than ours, root included, could not create
-            // anything. Squash every guest uid and gid onto ours. The guest
-            // user already has our uid, so our files look the same to it.
-            .arg("--translate-uid")
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("--socket-path")
+        .arg(socket)
+        .arg("--shared-dir")
+        .arg(root)
+        .args(["--cache", "auto", "--announce-submounts"])
+        // Not the default namespace sandbox: that maps the user to root inside
+        // it, and it is unavailable where unprivileged user namespaces are
+        // restricted (Ubuntu 24.04, containers).
+        .args(["--sandbox", "none"]);
+    if translate_ids {
+        // Unprivileged, virtiofsd cannot give files any owner but its own, so a
+        // guest user other than ours, root included, could not create anything.
+        // Squash every guest uid and gid onto ours. The guest user already has
+        // our uid, so our files look the same to it.
+        cmd.arg("--translate-uid")
             .arg(format!("squash-guest:0:{uid}:4294967295"))
             .arg("--translate-gid")
             .arg(format!("squash-guest:0:{gid}:4294967295"));
-        cmd
     }
+    cmd
 }
 
 /// Start the server for `vm`, sharing `root`, and wait until QEMU can connect.
@@ -174,29 +207,61 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn virtiofsd_runs_unprivileged_with_every_guest_user_squashed_onto_ours() {
+    fn command(translate_ids: bool) -> Vec<String> {
         let cmd = virtiofsd_command(
             Path::new("/usr/lib/qemu/virtiofsd"),
             Path::new("/home/me"),
             Path::new("/run/user/1000/vmmbox/ubuntu.vfs.sock"),
             1000,
             1001,
+            translate_ids,
         );
         assert_eq!(cmd.get_program(), "/usr/lib/qemu/virtiofsd");
-        let a = args(&cmd);
-        let has = |w: &[&str]| a.windows(w.len()).any(|x| x == w);
-        assert!(has(&[
-            "--socket-path",
-            "/run/user/1000/vmmbox/ubuntu.vfs.sock"
-        ]));
-        assert!(has(&["--shared-dir", "/home/me"]));
+        args(&cmd)
+    }
+
+    fn has(a: &[String], flag: &str, value: &str) -> bool {
+        a.windows(2).any(|w| w[0] == flag && w[1] == value)
+    }
+
+    #[test]
+    fn virtiofsd_runs_unprivileged_with_every_guest_user_squashed_onto_ours() {
+        let a = command(true);
+        let socket = "/run/user/1000/vmmbox/ubuntu.vfs.sock";
+        assert!(has(&a, "--socket-path", socket));
+        assert!(has(&a, "--shared-dir", "/home/me"));
         // Without squashing, a guest user other than ours (root included) could
         // not create files: virtiofsd cannot chown as an ordinary user.
-        assert!(has(&["--translate-uid", "squash-guest:0:1000:4294967295"]));
-        assert!(has(&["--translate-gid", "squash-guest:0:1001:4294967295"]));
-        // The default namespace sandbox is unavailable where unprivileged user
-        // namespaces are restricted.
-        assert!(has(&["--sandbox", "none"]));
+        assert!(has(&a, "--translate-uid", "squash-guest:0:1000:4294967295"));
+        assert!(has(&a, "--translate-gid", "squash-guest:0:1001:4294967295"));
+        // The namespace sandbox is unavailable in containers and on Ubuntu 24.04.
+        assert!(has(&a, "--sandbox", "none"));
+    }
+
+    /// An old virtiofsd rejects `--translate-uid` and would not start at all.
+    #[test]
+    fn an_old_virtiofsd_is_started_without_id_translation() {
+        let a = command(false);
+        assert!(!a.iter().any(|x| x.starts_with("--translate-")));
+        assert!(has(&a, "--shared-dir", "/home/me"));
+    }
+
+    #[test]
+    fn id_translation_is_detected_from_the_help_text() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vmmbox-fsd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = |name: &str, help: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\necho '{help}'\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let new = fake("new", "  --translate-uid <MAP>  Translate uids");
+        let old = fake("old", "  --uid-map <MAP>  Map uids");
+        assert!(supports_id_translation(&new));
+        assert!(!supports_id_translation(&old));
+        assert!(!supports_id_translation(&dir.join("missing")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
