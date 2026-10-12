@@ -8,7 +8,7 @@ use crate::host::{self, Arch, Platform};
 use crate::http::Http;
 use crate::image::{Images, Pulled};
 use crate::paths::Paths;
-use crate::qemu::{self, Gpu, Launch, Qemu};
+use crate::qemu::{self, Audio, Gpu, Launch, Qemu};
 use crate::qmp::Endpoint;
 use crate::resources;
 use crate::share::{self, Transport};
@@ -291,6 +291,43 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// The optional devices QEMU can be started without.
+#[derive(Debug, PartialEq, Eq)]
+enum OptionalDevice {
+    Audio,
+    Gpu,
+}
+
+/// Which optional device to start QEMU again without, after it exited during
+/// start-up with `qemu_log` as its last words. With both, the log decides, and
+/// the GPU is blamed unless the log is about sound; if it is the other one
+/// that was at fault, the next exit drops that too.
+fn device_to_drop(has_audio: bool, has_gpu: bool, qemu_log: &str) -> Option<OptionalDevice> {
+    match (has_audio, has_gpu) {
+        (false, false) => None,
+        (true, false) => Some(OptionalDevice::Audio),
+        (false, true) => Some(OptionalDevice::Gpu),
+        (true, true) if mentions_audio(qemu_log) => Some(OptionalDevice::Audio),
+        (true, true) => Some(OptionalDevice::Gpu),
+    }
+}
+
+fn mentions_audio(log: &str) -> bool {
+    let log = log.to_ascii_lowercase();
+    [
+        "audio",
+        "sound",
+        "dsound",
+        "wasapi",
+        "pulse",
+        "pipewire",
+        "alsa",
+        "coreaudio",
+    ]
+    .iter()
+    .any(|w| log.contains(w))
+}
+
 fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<Booted> {
     let name = vm.state.name.clone();
     let compute = resources::compute();
@@ -329,10 +366,10 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
         vfs_socket = socket;
         Some(vfs_socket.as_path())
     };
-    let audio = qemu.audio(platform.os);
+    let mut audio = qemu.audio(platform.os);
     let mut gpu = qemu.gpu(platform.os);
 
-    let args_for = |gpu: Option<&Gpu>| {
+    let args_for = |gpu: Option<&Gpu>, audio: Option<&Audio>| {
         qemu::build_args(&Launch {
             name: &name,
             platform,
@@ -345,11 +382,11 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
             share,
             console_log: &console_log,
             qmp: &endpoint,
-            audio: audio.as_ref(),
+            audio,
             gpu,
         })
     };
-    let args = args_for(gpu.as_ref().ok())?;
+    let args = args_for(gpu.as_ref().ok(), audio.as_ref())?;
 
     let first_boot = !vm.state.booted_before;
     let started = Instant::now();
@@ -372,16 +409,28 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
     eprintln!("Waiting for {name} to boot...");
     loop {
         if let Some(status) = child.try_wait()? {
-            // A GPU this host cannot actually drive must not stop the VM from
-            // booting: say why, and start again without it.
-            if let Ok(g) =
-                std::mem::replace(&mut gpu, Err("none (QEMU would not start with it)".into()))
-            {
+            // Sound or a GPU this host cannot actually drive must not stop the VM
+            // from booting: say why, and start again without it. (QEMU checks
+            // that an audio backend is built in, not that the machine has a
+            // sound device: a Windows PC with none, or a headless one, fails
+            // here.)
+            let log = tail_lines(&vm.qemu_log(), 5);
+            let dropped = match device_to_drop(audio.is_some(), gpu.is_ok(), &log) {
+                Some(OptionalDevice::Audio) => {
+                    audio.take().map(|a| format!("sound ({})", a.backend))
+                }
+                Some(OptionalDevice::Gpu) => {
+                    std::mem::replace(&mut gpu, Err("none (QEMU would not start with it)".into()))
+                        .ok()
+                        .map(|g| format!("the GPU ({})", g.describe()))
+                }
+                None => None,
+            };
+            if let Some(what) = dropped {
                 let why = tail_lines(&vm.qemu_log(), 1);
                 let why = why.trim();
                 eprintln!(
-                    "warning: QEMU could not start with the GPU ({}){}; starting without it",
-                    g.describe(),
+                    "warning: QEMU could not start with {what}{}; starting without it",
                     if why.is_empty() {
                         String::new()
                     } else {
@@ -389,7 +438,11 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
                     }
                 );
                 endpoint.cleanup();
-                child = qemu::spawn(qemu, &args_for(None)?, &vm.qemu_log())?;
+                child = qemu::spawn(
+                    qemu,
+                    &args_for(gpu.as_ref().ok(), audio.as_ref())?,
+                    &vm.qemu_log(),
+                )?;
                 vm.state.pid = Some(child.id());
                 vm.save()?;
                 continue;
@@ -807,6 +860,38 @@ fn remote_command(cwd: Option<&str>, command: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machine_with_no_sound_device_is_started_without_sound() {
+        // What QEMU prints on a Windows PC or runner with no sound device.
+        let log = "qemu-system-x86_64.exe: Could not initialize DirectSound: No sound \
+                   driver is available for use, or the given GUID is not a valid DirectSound \
+                   device ID";
+        assert_eq!(
+            device_to_drop(true, false, log),
+            Some(OptionalDevice::Audio)
+        );
+        // Even with a GPU along, the log names the culprit.
+        assert_eq!(device_to_drop(true, true, log), Some(OptionalDevice::Audio));
+    }
+
+    #[test]
+    fn a_gpu_failure_still_drops_the_gpu() {
+        let log = "qemu-system-x86_64: egl: no render node available";
+        assert_eq!(device_to_drop(false, true, log), Some(OptionalDevice::Gpu));
+        // With sound along too, the GPU is blamed first (as before sound was
+        // optional), and sound goes next if QEMU still will not start.
+        assert_eq!(device_to_drop(true, true, log), Some(OptionalDevice::Gpu));
+        assert_eq!(
+            device_to_drop(true, false, log),
+            Some(OptionalDevice::Audio)
+        );
+    }
+
+    #[test]
+    fn nothing_optional_left_means_the_failure_is_real() {
+        assert_eq!(device_to_drop(false, false, "audio: whatever"), None);
+    }
 
     #[test]
     fn remote_command_quotes_every_word() {
