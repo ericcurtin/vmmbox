@@ -170,8 +170,8 @@ jobs:
             mode: boot
           # WHPX runs inside a Hyper-V VM here, and now and then the guest kernel
           # panics at once in fpu__init_system_xstate (the XSAVE state that the
-          # nested hypervisor reports is inconsistent): about one boot in eight in
-          # my samples, with `-cpu max`. vmmbox reports it as a guest panic within
+          # nested hypervisor reports is inconsistent): one boot in about ten of
+          # those I saw, with `-cpu max`. vmmbox reports it as a guest panic within
           # seconds, and only that is retried (flaky_start), up to three tries.
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
