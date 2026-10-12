@@ -66,6 +66,25 @@ vmo() {
 	rm -f "$f" || true # QEMU may still hold the file open on Windows
 	return "$rc"
 }
+# Start the VM like `vmo start`, but try again (up to three times) if it fails
+# with a message matching E2E_RETRY_START_ON, a flake of the runner and not of
+# vmmbox, named by the workflow for the platforms that have one. Anything else
+# fails at once, so a real regression is never retried away.
+start_vm() {
+	local attempt=1 out rc
+	while :; do
+		rc=0
+		out="$(vmo start "$distro")" || rc=$?
+		if [ "$rc" -ne 0 ] && [ "$attempt" -lt 3 ] && [ -n "${E2E_RETRY_START_ON:-}" ] &&
+			grep -Eq "$E2E_RETRY_START_ON" <<<"$out"; then
+			attempt=$((attempt + 1))
+			printf '::warning::start failed with a known flake of this runner (%s): trying again, attempt %s of 3.\n' "$E2E_RETRY_START_ON" "$attempt" >&2
+			continue
+		fi
+		printf '%s' "$out"
+		return "$rc"
+	done
+}
 # The guest answers over ssh; strip the CR a Windows ssh may add.
 guest() { vm run "$distro" "$@" | tr -d '\r'; }
 
@@ -147,7 +166,7 @@ fi
 
 # ---------------------------------------------------------------------------
 step "first boot"
-out="$(vmo start "$distro")"
+out="$(start_vm)"
 grep -q "Started $distro" <<<"$out" || fail "start did not report the VM as started"
 grep -qi "$accel accelerated" <<<"$out" || fail "the VM did not start with $accel acceleration"
 
@@ -199,7 +218,7 @@ awk -v n="$distro" '$1 == n && $3 == "Stopped" { found = 1 } END { exit !found }
 ! qemu_running || fail "QEMU is still running after stop"
 
 step "second boot: the disk survived the shutdown"
-out="$(vmo start "$distro")"
+out="$(start_vm)"
 grep -q "Started $distro" <<<"$out" || fail "the VM did not start the second time"
 [ "$(guest cat /var/lib/vmmbox-e2e)" = persisted ] || fail "data written before the shutdown is gone"
 if [ "$windows" = 0 ]; then

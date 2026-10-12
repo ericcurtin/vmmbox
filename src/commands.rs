@@ -291,6 +291,27 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// The kernel's own report that the guest has crashed, if the console log has
+/// one. Read as bytes: the console carries terminal escape sequences, and a
+/// strict UTF-8 read would see nothing at all.
+fn guest_panic(console: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(console).ok()?;
+    find_panic(&String::from_utf8_lossy(&bytes))
+}
+
+/// The first "Kernel panic" line of console output, without its timestamp.
+fn find_panic(text: &str) -> Option<String> {
+    let line = text
+        .lines()
+        .find(|l| l.contains("Kernel panic - not syncing"))?
+        .trim();
+    // "[    2.746195] Kernel panic - not syncing: ..." -> "Kernel panic - ..."
+    Some(match line.split_once("] ") {
+        Some((stamp, rest)) if stamp.starts_with('[') => rest.trim().to_string(),
+        _ => line.to_string(),
+    })
+}
+
 /// The optional devices QEMU can be started without.
 #[derive(Debug, PartialEq, Eq)]
 enum OptionalDevice {
@@ -407,6 +428,7 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
 
     let ssh = Ssh::for_vm(vm)?;
     eprintln!("Waiting for {name} to boot...");
+    let mut polls = 0u32;
     loop {
         if let Some(status) = child.try_wait()? {
             // Sound or a GPU this host cannot actually drive must not stop the VM
@@ -459,6 +481,24 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
                     format!(":\n{log}")
                 },
                 vm.qemu_log().display()
+            );
+        }
+        // A guest whose kernel has panicked will never answer SSH: say so now,
+        // not after the boot timeout. (Looked at every few seconds, not every
+        // probe: the console log can be large.)
+        polls += 1;
+        if polls.is_multiple_of(5)
+            && let Some(panic) = guest_panic(&vm.console_log())
+        {
+            crate::proc::kill_qemu(child.id());
+            let _ = child.wait();
+            endpoint.cleanup();
+            vm.state.pid = None;
+            vm.state.started_at = None;
+            vm.save()?;
+            bail!(
+                "the guest kernel panicked during boot ({panic}); see {}",
+                vm.console_log().display()
             );
         }
         let last_ssh_error = match ssh.probe_detail() {
@@ -861,6 +901,46 @@ fn remote_command(cwd: Option<&str>, command: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kernel_panic_on_the_console_is_found_and_reported() {
+        let console = "[    2.743200] ---[ end trace 0000000000000000 ]---\n\
+                       [    2.745203] BUG: kernel NULL pointer dereference, address: 0000000000000010\n\
+                       [    2.746195] Kernel panic - not syncing: Attempted to kill the idle task!\n\
+                       [    2.746195] ---[ end Kernel panic - not syncing: Attempted to kill the idle task! ]---\n";
+        assert_eq!(
+            find_panic(console).as_deref(),
+            Some("Kernel panic - not syncing: Attempted to kill the idle task!")
+        );
+    }
+
+    #[test]
+    fn a_healthy_boot_has_no_panic() {
+        let console = "[    0.000000] Linux version 7.0.0-34-generic\n\
+                       [  OK  ] Started serial-getty@ttyS0.service - Serial Getty on ttyS0.\n\
+                       \u{1b}[?7hUbuntu 26.04.1 LTS ubuntu ttyS0\n";
+        assert_eq!(find_panic(console), None);
+        assert_eq!(find_panic(""), None);
+    }
+
+    /// The console carries escape sequences and sometimes bytes that are not
+    /// UTF-8; the panic must still be found.
+    #[test]
+    fn a_panic_is_found_in_a_console_that_is_not_valid_utf8() {
+        let path = std::env::temp_dir().join(format!("vmmbox-console-{}", std::process::id()));
+        let mut bytes = b"[    1.0] boot\n\xff\xfe garbage\n".to_vec();
+        bytes.extend_from_slice(b"[    2.7] Kernel panic - not syncing: boom\n");
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            guest_panic(&path).as_deref(),
+            Some("Kernel panic - not syncing: boom")
+        );
+        assert_eq!(
+            guest_panic(std::path::Path::new("/no/such/console.log")),
+            None
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn a_machine_with_no_sound_device_is_started_without_sound() {

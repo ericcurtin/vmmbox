@@ -168,12 +168,18 @@ jobs:
             arch: x86_64
             accel: kvm
             mode: boot
+          # WHPX runs inside a Hyper-V VM here, and now and then the guest kernel
+          # panics at once in fpu__init_system_xstate (the XSAVE state that the
+          # nested hypervisor reports is inconsistent): about one boot in eight in
+          # my samples, with `-cpu max`. vmmbox reports it as a guest panic within
+          # seconds, and only that is retried (flaky_start), up to three tries.
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             asset: vmmbox-x86_64-pc-windows-msvc.exe
             arch: x86_64
             accel: whpx
             mode: boot
+            flaky_start: 'guest kernel panicked'
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
             asset: vmmbox-aarch64-unknown-linux-musl
@@ -245,6 +251,7 @@ jobs:
         shell: bash
         env:
           E2E_EXPECT_ERROR: ${{ matrix.expect }}
+          E2E_RETRY_START_ON: ${{ matrix.flaky_start }}
         run: ci/e2e.sh "${{ matrix.mode }}" "dist/${{ matrix.asset }}" "${{ matrix.arch }}" "${{ matrix.accel }}"
 
       # The script prints these itself when a check fails. It cannot when the
