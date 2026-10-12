@@ -104,6 +104,8 @@ boot_vm() {
 	out="$(start_vm)"
 	grep -q "Started $distro" <<<"$out" || fail "the VM did not start"
 	grep -qi "$accel accelerated" <<<"$out" || fail "the VM did not start with $accel acceleration"
+	[ -z "${E2E_EXPECT_WARNING:-}" ] || grep -q "$E2E_EXPECT_WARNING" <<<"$out" ||
+		fail "start did not warn: '$E2E_EXPECT_WARNING'"
 }
 
 stop_vm() {

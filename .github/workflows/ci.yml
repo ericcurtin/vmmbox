@@ -147,7 +147,7 @@ jobs:
   # reboot). Those `nohw` legs pull the image and check that `start` fails with
   # a clear error, and warn if a runner can boot after all. See ci/e2e.sh.
   e2e:
-    name: E2E ${{ matrix.target }} (${{ matrix.mode }})
+    name: E2E ${{ matrix.target }} (${{ matrix.mode }}${{ matrix.packages == 'apt' && ', distro packages' || '' }})
     needs: build
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -155,7 +155,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, mode: boot}
+          - {target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, mode: boot, packages: brew}
+          # Ubuntu's own QEMU 8.2 and virtiofsd 1.10, which lacks --translate-uid.
+          - {target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, mode: boot, packages: apt}
           - {target: x86_64-pc-windows-msvc, runner: windows-latest, mode: boot}
           - {target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, mode: nohw}
           - {target: aarch64-apple-darwin, runner: macos-latest, mode: nohw}
@@ -178,23 +180,32 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      # Homebrew's, as the formula installs them: Ubuntu 24.04's apt virtiofsd
-      # (1.10) lacks --translate-uid, which vmmbox passes.
-      - name: Install QEMU and virtiofsd
-        if: runner.os == 'Linux' && matrix.mode == 'boot'
+      # Homebrew's, as the formula installs them.
+      - name: Install QEMU and virtiofsd (Homebrew)
+        if: matrix.packages == 'brew'
         run: |
-          /home/linuxbrew/.linuxbrew/bin/brew install qemu virtiofsd
+          ci/retry.sh /home/linuxbrew/.linuxbrew/bin/brew install qemu virtiofsd
           echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
+
+      - name: Install QEMU and virtiofsd (apt)
+        if: matrix.packages == 'apt'
+        run: |
+          ci/retry.sh sudo apt-get update -qq
+          ci/retry.sh sudo apt-get install -y -qq qemu-system-x86 qemu-utils virtiofsd
 
       # The upstream installer that Scoop's qemu package uses.
       - name: Install QEMU
         if: runner.os == 'Windows' && matrix.mode == 'boot'
-        run: choco install qemu --no-progress -y
+        shell: bash
+        run: ci/retry.sh choco install qemu --no-progress -y
 
       # Capped, so a hung guest fails with logs instead of at the job limit.
       - name: End-to-end test
         timeout-minutes: 25
         shell: bash
+        env:
+          # Old virtiofsd: start must warn that it runs without id translation.
+          E2E_EXPECT_WARNING: ${{ matrix.packages == 'apt' && 'cannot translate guest user ids' || '' }}
         run: ci/e2e.sh "${{ matrix.mode }}" dist/* "${{ matrix.target }}"
 
       # The script prints these itself unless the step was killed.
@@ -214,7 +225,7 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: e2e-logs-${{ matrix.target }}
+          name: e2e-logs-${{ matrix.target }}-${{ matrix.packages || 'default' }}
           path: ${{ runner.temp }}/vmmbox-e2e/**/*.log
           if-no-files-found: ignore
 
