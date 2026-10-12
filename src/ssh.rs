@@ -14,20 +14,36 @@ use std::time::{Duration, Instant};
 
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
+/// The directories to look for ssh tools in, best first.
+///
+/// On Windows that is the system's own OpenSSH before `PATH`: the arguments
+/// vmmbox passes (`-F NUL`, a quoted known-hosts path) are written for it, and
+/// another ssh earlier on `PATH` mis-parses them. Git for Windows ships one,
+/// built on MSYS, and is on `PATH` for anyone who runs vmmbox from Git Bash.
+fn tool_dirs(windows: bool, path: Option<OsString>, system_root: Option<OsString>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if windows {
+        // The optional "OpenSSH Client" feature installs here.
+        let root = system_root.unwrap_or_else(|| r"C:\Windows".into());
+        dirs.push(PathBuf::from(root).join("System32").join("OpenSSH"));
+    }
+    if let Some(path) = path {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs
+}
+
 fn find_tool(name: &str) -> Result<PathBuf> {
     let file = if cfg!(windows) {
         format!("{name}.exe")
     } else {
         name.to_string()
     };
-    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    if cfg!(windows) {
-        // The optional "OpenSSH Client" feature installs here.
-        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-        dirs.push(PathBuf::from(root).join("System32").join("OpenSSH"));
-    }
+    let dirs = tool_dirs(
+        cfg!(windows),
+        std::env::var_os("PATH"),
+        std::env::var_os("SystemRoot"),
+    );
     dirs.iter()
         .map(|d| d.join(&file))
         .find(|p| p.is_file())
@@ -277,6 +293,39 @@ mod tests {
             user: "me".into(),
         };
         (ssh, dir)
+    }
+
+    #[test]
+    fn windows_prefers_its_own_openssh_over_one_on_the_path() {
+        let path = Some(std::env::join_paths(["/git/usr/bin", "/other"]).unwrap());
+        let dirs = tool_dirs(true, path.clone(), Some(r"D:\Win".into()));
+        assert_eq!(
+            dirs[0],
+            PathBuf::from(r"D:\Win").join("System32").join("OpenSSH")
+        );
+        assert_eq!(
+            &dirs[1..],
+            [PathBuf::from("/git/usr/bin"), PathBuf::from("/other")]
+        );
+        // Without SystemRoot, the usual place.
+        let dirs = tool_dirs(true, None, None);
+        assert_eq!(
+            dirs,
+            [PathBuf::from(r"C:\Windows")
+                .join("System32")
+                .join("OpenSSH")]
+        );
+    }
+
+    #[test]
+    fn elsewhere_only_the_path_is_searched() {
+        let path = Some(std::env::join_paths(["/usr/bin", "/usr/local/bin"]).unwrap());
+        let dirs = tool_dirs(false, path, Some("ignored".into()));
+        assert_eq!(
+            dirs,
+            [PathBuf::from("/usr/bin"), PathBuf::from("/usr/local/bin")]
+        );
+        assert!(tool_dirs(false, None, None).is_empty());
     }
 
     #[test]
