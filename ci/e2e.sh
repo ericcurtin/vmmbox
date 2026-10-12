@@ -63,6 +63,9 @@ vmo() {
 	kill "$tailer" 2>/dev/null || true
 	wait "$tailer" 2>/dev/null || true
 	cat "$f"
+	# What the last command said and whether it failed, for E2E_KNOWN_FAILURE.
+	cp "$f" "$scratch/last-vmmbox-output" 2>/dev/null || true
+	echo "$rc" >"$scratch/last-vmmbox-status"
 	rm -f "$f" || true # QEMU may still hold the file open on Windows
 	return "$rc"
 }
@@ -84,13 +87,27 @@ cleanup() {
 	local status=$?
 	if [ "$status" -ne 0 ]; then
 		touch "$scratch/.diagnosed" # tells the workflow not to repeat this
-		[ -z "${E2E_KNOWN_ISSUE:-}" ] || printf '::warning::Known issue: %s\n' "$E2E_KNOWN_ISSUE"
 		printf '\n==== FAILED (exit %s): diagnostics ====\n' "$status"
 		"$vmmbox" ps -a 2>&1 || true
 		while IFS= read -r log; do
 			printf '\n---- %s (last 60 lines)\n' "$log"
 			tail -n 60 "$log" 2>/dev/null || true
 		done < <(find "$scratch" -name '*.log' 2>/dev/null)
+		# Removing the VM below deletes its logs: keep whole copies for the
+		# artifact the workflow uploads.
+		mkdir -p "$scratch/kept-logs"
+		while IFS= read -r log; do
+			cp "$log" "$scratch/kept-logs/$(basename "$(dirname "$log")")-$(basename "$log")" 2>/dev/null || true
+		done < <(find "$scratch/vms" -name '*.log' 2>/dev/null)
+		# A known bug is tolerated only while it fails the way it is documented
+		# to: the last vmmbox command failed, with a message matching
+		# E2E_KNOWN_FAILURE. Any other failure still fails the job.
+		if [ -n "${E2E_KNOWN_FAILURE:-}" ] &&
+			[ "$(cat "$scratch/last-vmmbox-status" 2>/dev/null || echo 0)" != 0 ] &&
+			grep -Eq "$E2E_KNOWN_FAILURE" "$scratch/last-vmmbox-output" 2>/dev/null; then
+			printf '::warning::Expected failure (a known bug): vmmbox failed with a message matching "%s".\n' "$E2E_KNOWN_FAILURE"
+			status=0
+		fi
 	fi
 	"$vmmbox" rm -f "$distro" </dev/null >/dev/null 2>&1 || true
 	[ -n "$home_work" ] && rm -rf "$home_work"
@@ -204,4 +221,6 @@ vm rm "$distro"
 listed="$(vm ls)"
 grep -q 'No VMs' <<<"$listed" || fail "the VM is still listed after rm"
 
+[ -z "${E2E_KNOWN_FAILURE:-}" ] ||
+	printf '::notice::The known failure "%s" did not happen: it looks fixed, so remove known_failure for this platform in ci.yml.\n' "$E2E_KNOWN_FAILURE"
 printf '\nOK: booted, ran, shut down gracefully, rebooted and removed %s on %s with %s\n' "$distro" "$want_arch" "$accel"
