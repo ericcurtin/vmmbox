@@ -461,12 +461,13 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
                 vm.qemu_log().display()
             );
         }
-        if ssh.probe() {
-            break;
-        }
+        let last_ssh_error = match ssh.probe_detail() {
+            Ok(()) => break,
+            Err(e) => e,
+        };
         if started.elapsed() > BOOT_TIMEOUT {
             bail!(
-                "{name} is running but did not accept SSH within {}s; see {}",
+                "{name} is running but did not accept SSH within {}s (ssh said: {last_ssh_error}); see {}",
                 BOOT_TIMEOUT.as_secs(),
                 vm.console_log().display()
             );

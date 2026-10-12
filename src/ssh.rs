@@ -135,16 +135,36 @@ impl Ssh {
 
     /// Whether the guest accepts our key right now.
     pub fn probe(&self) -> bool {
-        self.command()
+        self.probe_detail().is_ok()
+    }
+
+    /// Like `probe`, but says what ssh complained about if the guest does not
+    /// accept us, for the error shown when a VM never becomes reachable.
+    pub fn probe_detail(&self) -> std::result::Result<(), String> {
+        let out = self
+            .command()
             .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
             .arg(self.target())
             .arg("true")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| format!("could not run {}: {e}", self.ssh.display()))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let said = String::from_utf8_lossy(&out.stderr);
+        let said = said.trim();
+        Err(if said.is_empty() {
+            format!(
+                "{} exited with status {}",
+                self.ssh.display(),
+                exit_code(out.status)
+            )
+        } else {
+            said.to_string()
+        })
     }
 
     /// Run a non-interactive command and return its exit code.
@@ -257,6 +277,28 @@ mod tests {
             user: "me".into(),
         };
         (ssh, dir)
+    }
+
+    #[test]
+    fn a_failed_probe_says_what_ssh_complained_about() {
+        let (ssh, dir) = fake(
+            "probe",
+            "echo 'Permission denied (publickey).' >&2; exit 255",
+        );
+        assert!(!ssh.probe());
+        assert_eq!(
+            ssh.probe_detail().unwrap_err(),
+            "Permission denied (publickey)."
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_probe_that_succeeds_has_nothing_to_report() {
+        let (ssh, dir) = fake("probe-ok", "exit 0");
+        assert!(ssh.probe());
+        assert!(ssh.probe_detail().is_ok());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

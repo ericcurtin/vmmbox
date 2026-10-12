@@ -86,6 +86,13 @@ cleanup() {
 		touch "$scratch/.diagnosed" # tells the workflow not to repeat this
 		printf '\n==== FAILED (exit %s): diagnostics ====\n' "$status"
 		"$vmmbox" ps -a 2>&1 || true
+		if [ "$windows" = 1 ]; then
+			# Which ssh vmmbox would find, and whether its key is private enough.
+			printf '\n---- ssh clients on PATH\n'
+			where.exe ssh 2>&1 || true
+			printf '\n---- permissions on the VM key\n'
+			icacls "$scratch/vms/$distro/id_ed25519" 2>&1 || true
+		fi
 		while IFS= read -r log; do
 			printf '\n---- %s (last 60 lines)\n' "$log"
 			tail -n 60 "$log" 2>/dev/null || true
