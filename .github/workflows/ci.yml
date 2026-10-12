@@ -139,6 +139,158 @@ jobs:
           path: dist/${{ matrix.asset }}
           if-no-files-found: error
 
+  # Runs the binaries that will be released, in a real VM where the runner can
+  # host one. GitHub-hosted runners expose a hypervisor on only two of the five
+  # platforms (checked with a probe of each runner type):
+  #
+  #   ubuntu-24.04      /dev/kvm is there; a udev rule makes it usable
+  #   windows-latest    the Windows Hypervisor Platform is enabled
+  #   ubuntu-24.04-arm  no /dev/kvm: Neoverse-N2 VMs without nested virtualization
+  #   macos-latest      Apple M1 (Virtual): kern.hv_support is 0
+  #   windows-11-arm    WHPX is off, and turning it on needs a reboot
+  #
+  # `boot` must boot a VM, shut it down gracefully, boot it again and remove it.
+  # `nohw` (the runners with no hypervisor) pulls the image for that architecture
+  # and checks that `start` refuses with a clear error; it warns if a runner turns
+  # out to be able to boot, so the platform can be moved to `boot`. See ci/e2e.sh.
+  #
+  # Windows x64 is a `boot` test that fails today, and is therefore not allowed to
+  # block a release (known_broken): see its entry below.
+  e2e:
+    name: E2E ${{ matrix.target }} (${{ matrix.mode }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    continue-on-error: ${{ matrix.known_broken == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            asset: vmmbox-x86_64-unknown-linux-musl
+            arch: x86_64
+            accel: kvm
+            mode: boot
+          # WHPX works on this runner (QEMU boots Ubuntu to a login prompt in
+          # under a minute), but vmmbox cannot start a VM on Windows: it gives
+          # QEMU a `-chardev pipe` for QMP, and QEMU's Windows pipe chardev blocks
+          # at start-up until a client connects (chardev/char-pipe.c,
+          # win_chr_pipe_init) and serves only that one client. vmmbox connects
+          # only to stop the VM, so the guest never runs, and a stop could not
+          # work either. Remove known_broken when that is fixed.
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            asset: vmmbox-x86_64-pc-windows-msvc.exe
+            arch: x86_64
+            accel: whpx
+            mode: boot
+            known_broken: true
+            known_issue: "vmmbox cannot start VMs on Windows: QEMU blocks on the QMP pipe until a client connects. See the comment on this job in ci.yml."
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            asset: vmmbox-aarch64-unknown-linux-musl
+            arch: aarch64
+            accel: kvm
+            mode: nohw
+            expect: 'KVM is not usable'
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            asset: vmmbox-aarch64-apple-darwin
+            arch: aarch64
+            accel: hvf
+            mode: nohw
+            expect: 'Hypervisor\.framework'
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            asset: vmmbox-aarch64-pc-windows-msvc.exe
+            arch: aarch64
+            accel: whpx
+            mode: nohw
+            expect: 'qemu-system-aarch64 not found'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+
+      # Artifacts lose the executable bit.
+      - name: Make the binary executable
+        shell: bash
+        run: chmod +x "dist/${{ matrix.asset }}"
+
+      # GitHub's runners give /dev/kvm to root and the kvm group only.
+      - name: Enable KVM
+        if: runner.os == 'Linux' && matrix.mode == 'boot'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      # Exactly what the Homebrew formula depends on for Linux. Not apt: Ubuntu
+      # 24.04's virtiofsd (1.10) lacks --translate-uid, which vmmbox passes.
+      - name: Install QEMU and virtiofsd
+        if: runner.os == 'Linux' && matrix.mode == 'boot'
+        run: |
+          /home/linuxbrew/.linuxbrew/bin/brew install qemu virtiofsd
+          echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
+          /home/linuxbrew/.linuxbrew/bin/qemu-system-x86_64 --version | head -1
+          /home/linuxbrew/.linuxbrew/bin/virtiofsd --version
+
+      # What `scoop install vmmbox` pulls in (the same upstream installer).
+      - name: Install QEMU
+        if: runner.os == 'Windows' && matrix.mode == 'boot'
+        shell: bash
+        run: |
+          choco install qemu --no-progress -y
+          "/c/Program Files/qemu/qemu-system-x86_64.exe" --version
+
+      # A full boot test takes about ten minutes. The step limit turns a hung
+      # guest into a failure with logs, rather than a job that is killed at the
+      # job limit with nothing to read.
+      - name: End-to-end test
+        timeout-minutes: 25
+        shell: bash
+        env:
+          E2E_EXPECT_ERROR: ${{ matrix.expect }}
+          E2E_KNOWN_ISSUE: ${{ matrix.known_issue }}
+        run: ci/e2e.sh "${{ matrix.mode }}" "dist/${{ matrix.asset }}" "${{ matrix.arch }}" "${{ matrix.accel }}"
+
+      # The script prints these itself when a check fails. It cannot when the
+      # step is killed for running too long, so do it here in that case.
+      - name: Show the VM logs
+        if: failure() || cancelled()
+        shell: bash
+        run: |
+          [ -e "$RUNNER_TEMP/vmmbox-e2e/.diagnosed" ] && exit 0
+          echo "The test did not finish. Its VM logs:"
+          find "$RUNNER_TEMP/vmmbox-e2e" -name '*.log' | while IFS= read -r log; do
+            printf '\n---- %s (last 80 lines)\n' "$log"
+            tail -n 80 "$log" || true
+          done
+          echo; echo "Processes:"
+          if [ "$RUNNER_OS" = Windows ]; then
+            tasklist | grep -i -E 'qemu|vmmbox|ssh' || true
+            echo; echo "QEMU command line:"
+            powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name like 'qemu%'\" | ForEach-Object { \$_.CommandLine }" || true
+          else
+            pgrep -fa 'qemu|vmmbox|virtiofsd' || true
+          fi
+
+      # The script prints the tail of each log; this keeps them whole.
+      - name: Keep the VM logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-logs-${{ matrix.target }}
+          path: ${{ runner.temp }}/vmmbox-e2e/**/*.log
+          if-no-files-found: ignore
+
   packaging:
     name: Packaging
     runs-on: ubuntu-24.04
@@ -247,7 +399,7 @@ jobs:
   release:
     name: Publish release
     # Everything must be green first.
-    needs: [tag, test, build, packaging]
+    needs: [tag, test, build, e2e, packaging]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
     permissions:
