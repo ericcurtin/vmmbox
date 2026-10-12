@@ -97,6 +97,12 @@ cleanup() {
 			printf '\n---- %s (last 60 lines)\n' "$log"
 			tail -n 60 "$log" 2>/dev/null || true
 		done < <(find "$scratch" -name '*.log' 2>/dev/null)
+		# Removing the VM below deletes its logs: keep whole copies for the
+		# artifact the workflow uploads.
+		mkdir -p "$scratch/kept-logs"
+		while IFS= read -r log; do
+			cp "$log" "$scratch/kept-logs/$(basename "$(dirname "$log")")-$(basename "$log")" 2>/dev/null || true
+		done < <(find "$scratch/vms" -name '*.log' 2>/dev/null)
 	fi
 	"$vmmbox" rm -f "$distro" </dev/null >/dev/null 2>&1 || true
 	[ -n "$home_work" ] && rm -rf "$home_work"
