@@ -8,7 +8,7 @@ use crate::host::{self, Arch, Platform};
 use crate::http::Http;
 use crate::image::{Images, Pulled};
 use crate::paths::Paths;
-use crate::qemu::{self, Gpu, Launch, Qemu};
+use crate::qemu::{self, Audio, Gpu, Launch, Qemu};
 use crate::qmp::Endpoint;
 use crate::resources;
 use crate::share::{self, Transport};
@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 /// How long to wait for a guest to accept SSH after QEMU starts.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(300);
-/// How long to give a guest to power off after an ACPI shutdown request.
+/// How long to give a guest to power off after a shutdown request.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `vmmbox setup`: install the QEMU build vmmbox ships for this machine.
@@ -291,6 +291,52 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// The guest kernel's panic message, if the console log has one. Read as bytes:
+/// the console carries escape sequences that a strict UTF-8 read would reject.
+fn guest_panic(console: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(console).ok()?;
+    find_panic(&String::from_utf8_lossy(&bytes))
+}
+
+/// The first "Kernel panic" line of console output, minus its `[  2.7]` stamp.
+fn find_panic(text: &str) -> Option<String> {
+    let line = text
+        .lines()
+        .find(|l| l.contains("Kernel panic - not syncing"))?
+        .trim();
+    Some(match line.split_once("] ") {
+        Some((stamp, rest)) if stamp.starts_with('[') => rest.trim().to_string(),
+        _ => line.to_string(),
+    })
+}
+
+/// The optional devices QEMU can be started without.
+#[derive(Debug, PartialEq, Eq)]
+enum OptionalDevice {
+    Audio,
+    Gpu,
+}
+
+/// Which optional device to restart QEMU without after it exited at start-up.
+/// With both, the GPU is blamed unless the log is about sound; if that was
+/// wrong, the next exit drops the other one too.
+fn device_to_drop(has_audio: bool, has_gpu: bool, qemu_log: &str) -> Option<OptionalDevice> {
+    match (has_audio, has_gpu) {
+        (false, false) => None,
+        (true, false) => Some(OptionalDevice::Audio),
+        (false, true) => Some(OptionalDevice::Gpu),
+        (true, true) if mentions_audio(qemu_log) => Some(OptionalDevice::Audio),
+        (true, true) => Some(OptionalDevice::Gpu),
+    }
+}
+
+fn mentions_audio(log: &str) -> bool {
+    let log = log.to_ascii_lowercase();
+    ["audio", "sound", "wasapi", "pulse", "pipewire", "alsa"]
+        .iter()
+        .any(|w| log.contains(w))
+}
+
 fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<Booted> {
     let name = vm.state.name.clone();
     let compute = resources::compute();
@@ -329,10 +375,10 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
         vfs_socket = socket;
         Some(vfs_socket.as_path())
     };
-    let audio = qemu.audio(platform.os);
+    let mut audio = qemu.audio(platform.os);
     let mut gpu = qemu.gpu(platform.os);
 
-    let args_for = |gpu: Option<&Gpu>| {
+    let args_for = |gpu: Option<&Gpu>, audio: Option<&Audio>| {
         qemu::build_args(&Launch {
             name: &name,
             platform,
@@ -345,11 +391,11 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
             share,
             console_log: &console_log,
             qmp: &endpoint,
-            audio: audio.as_ref(),
+            audio,
             gpu,
         })
     };
-    let args = args_for(gpu.as_ref().ok())?;
+    let args = args_for(gpu.as_ref().ok(), audio.as_ref())?;
 
     let first_boot = !vm.state.booted_before;
     let started = Instant::now();
@@ -370,18 +416,29 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
 
     let ssh = Ssh::for_vm(vm)?;
     eprintln!("Waiting for {name} to boot...");
+    let mut polls = 0u32;
     loop {
         if let Some(status) = child.try_wait()? {
-            // A GPU this host cannot actually drive must not stop the VM from
-            // booting: say why, and start again without it.
-            if let Ok(g) =
-                std::mem::replace(&mut gpu, Err("none (QEMU would not start with it)".into()))
-            {
+            // Sound or a GPU the host cannot drive must not stop the VM booting:
+            // say why and start again without it. (QEMU checks that an audio
+            // backend is built in, not that there is a device to play on.)
+            let log = tail_lines(&vm.qemu_log(), 5);
+            let dropped = match device_to_drop(audio.is_some(), gpu.is_ok(), &log) {
+                Some(OptionalDevice::Audio) => {
+                    audio.take().map(|a| format!("sound ({})", a.backend))
+                }
+                Some(OptionalDevice::Gpu) => {
+                    std::mem::replace(&mut gpu, Err("none (QEMU would not start with it)".into()))
+                        .ok()
+                        .map(|g| format!("the GPU ({})", g.describe()))
+                }
+                None => None,
+            };
+            if let Some(what) = dropped {
                 let why = tail_lines(&vm.qemu_log(), 1);
                 let why = why.trim();
                 eprintln!(
-                    "warning: QEMU could not start with the GPU ({}){}; starting without it",
-                    g.describe(),
+                    "warning: QEMU could not start with {what}{}; starting without it",
                     if why.is_empty() {
                         String::new()
                     } else {
@@ -389,14 +446,26 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
                     }
                 );
                 endpoint.cleanup();
-                child = qemu::spawn(qemu, &args_for(None)?, &vm.qemu_log())?;
+                // QEMU connects to the virtio-fs server before it sets up sound
+                // or the GPU, and the server exits when QEMU does: start another.
+                if share.is_some() {
+                    if let Some(pid) = vm.state.fsd_pid.take() {
+                        fsd::stop(pid);
+                    }
+                    let (pid, socket) = fsd::start(paths, vm, &host_home, platform.os)?;
+                    fsd.started = Some((pid, socket));
+                    vm.state.fsd_pid = Some(pid);
+                }
+                child = qemu::spawn(
+                    qemu,
+                    &args_for(gpu.as_ref().ok(), audio.as_ref())?,
+                    &vm.qemu_log(),
+                )?;
                 vm.state.pid = Some(child.id());
                 vm.save()?;
                 continue;
             }
-            vm.state.pid = None;
-            vm.state.started_at = None;
-            vm.save()?;
+            vm.mark_stopped()?;
             let log = tail_lines(&vm.qemu_log(), 15);
             bail!(
                 "QEMU exited during start-up ({status}){}\nlog: {}",
@@ -408,12 +477,28 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
                 vm.qemu_log().display()
             );
         }
-        if ssh.probe() {
-            break;
+        // A guest that has panicked will never answer SSH: fail now, not at the
+        // timeout. Every few seconds only: the console log can be large.
+        polls += 1;
+        if polls.is_multiple_of(5)
+            && let Some(panic) = guest_panic(&vm.console_log())
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            endpoint.cleanup();
+            vm.mark_stopped()?;
+            bail!(
+                "the guest kernel panicked during boot ({panic}); see {}",
+                vm.console_log().display()
+            );
         }
+        let last_ssh_error = match ssh.probe_detail() {
+            Ok(()) => break,
+            Err(e) => e,
+        };
         if started.elapsed() > BOOT_TIMEOUT {
             bail!(
-                "{name} is running but did not accept SSH within {}s; see {}",
+                "{name} is running but did not accept SSH within {}s (ssh said: {last_ssh_error}); see {}",
                 BOOT_TIMEOUT.as_secs(),
                 vm.console_log().display()
             );
@@ -557,23 +642,31 @@ fn wait_exit(pid: u32, timeout: Duration) -> bool {
     !crate::proc::is_qemu(pid)
 }
 
+/// Ask the guest to shut down: the ACPI power button through QEMU's control
+/// channel, or on Windows (which has none) a power-off request over SSH.
+fn request_shutdown(vm: &Vm, endpoint: &Endpoint) -> Result<()> {
+    if endpoint.available() {
+        endpoint.execute("system_powerdown", Duration::from_secs(10))
+    } else {
+        Ssh::for_vm(vm)?.power_off(Duration::from_secs(20))
+    }
+}
+
 /// Shut a VM down, gracefully if the guest cooperates. Returns whether it was
 /// running.
 fn stop_vm(paths: &Paths, vm: &mut Vm) -> Result<bool> {
     let name = vm.state.name.clone();
     let Some(pid) = vm.running_pid() else {
         if vm.state.pid.is_some() {
-            vm.state.pid = None;
-            vm.state.started_at = None;
-            vm.save()?;
+            vm.mark_stopped()?;
         }
         return Ok(false);
     };
 
     let endpoint = Endpoint::for_vm(paths, &name)?;
     eprintln!("Stopping {name}...");
-    // Ask politely first (ACPI power button) so the guest unmounts and syncs.
-    let graceful = match endpoint.execute("system_powerdown", Duration::from_secs(10)) {
+    // Ask politely first so the guest unmounts and syncs.
+    let graceful = match request_shutdown(vm, &endpoint) {
         Ok(()) => wait_exit(pid, SHUTDOWN_TIMEOUT),
         Err(e) => {
             eprintln!("warning: could not ask the guest to shut down: {e:#}");
@@ -596,9 +689,7 @@ fn stop_vm(paths: &Paths, vm: &mut Vm) -> Result<bool> {
     if let Some(pid) = vm.state.fsd_pid.take() {
         fsd::stop(pid);
     }
-    vm.state.pid = None;
-    vm.state.started_at = None;
-    vm.save()?;
+    vm.mark_stopped()?;
     Ok(true)
 }
 
@@ -796,6 +887,57 @@ fn remote_command(cwd: Option<&str>, command: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kernel_panic_is_found_and_a_healthy_boot_has_none() {
+        let panicked = "[    2.745203] BUG: kernel NULL pointer dereference\n\
+                        [    2.746195] Kernel panic - not syncing: Attempted to kill the idle task!\n\
+                        [    2.746195] ---[ end Kernel panic - not syncing: Attempted to kill the idle task! ]---\n";
+        assert_eq!(
+            find_panic(panicked).as_deref(),
+            Some("Kernel panic - not syncing: Attempted to kill the idle task!")
+        );
+        let healthy =
+            "[    0.000000] Linux version 7.0.0-34-generic\n\u{1b}[?7hUbuntu 26.04.1 LTS ttyS0\n";
+        assert_eq!(find_panic(healthy), None);
+    }
+
+    /// The console has escape sequences and sometimes bytes that are not UTF-8.
+    #[test]
+    fn a_panic_is_found_in_a_console_that_is_not_valid_utf8() {
+        let path = std::env::temp_dir().join(format!("vmmbox-console-{}", std::process::id()));
+        let mut bytes = b"[    1.0] boot\n\xff\xfe garbage\n".to_vec();
+        bytes.extend_from_slice(b"[    2.7] Kernel panic - not syncing: boom\n");
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            guest_panic(&path).as_deref(),
+            Some("Kernel panic - not syncing: boom")
+        );
+        assert_eq!(guest_panic(std::path::Path::new("/no/such/log")), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_device_to_drop_follows_the_qemu_log() {
+        let no_sound = "qemu-system-x86_64.exe: Could not initialize DirectSound: No sound driver is available";
+        let gpu = "qemu-system-x86_64: egl: no render node available";
+        // One device: that one. None: the failure is real.
+        assert_eq!(
+            device_to_drop(true, false, gpu),
+            Some(OptionalDevice::Audio)
+        );
+        assert_eq!(
+            device_to_drop(false, true, no_sound),
+            Some(OptionalDevice::Gpu)
+        );
+        assert_eq!(device_to_drop(false, false, no_sound), None);
+        // Both: the log names the culprit, and the GPU is blamed by default.
+        assert_eq!(
+            device_to_drop(true, true, no_sound),
+            Some(OptionalDevice::Audio)
+        );
+        assert_eq!(device_to_drop(true, true, gpu), Some(OptionalDevice::Gpu));
+    }
 
     #[test]
     fn remote_command_quotes_every_word() {

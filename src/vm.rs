@@ -116,6 +116,13 @@ impl Vm {
         self.running_pid().is_some()
     }
 
+    /// Record that QEMU is no longer running.
+    pub fn mark_stopped(&mut self) -> Result<()> {
+        self.state.pid = None;
+        self.state.started_at = None;
+        self.save()
+    }
+
     pub fn save(&self) -> Result<()> {
         let tmp = self.dir.join("vm.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(&self.state)?)?;
