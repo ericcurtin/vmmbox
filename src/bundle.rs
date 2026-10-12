@@ -42,13 +42,16 @@ pub enum Outcome {
     Installed,
 }
 
-fn host_target(platform: Platform) -> &'static str {
+/// The target a QEMU bundle would be built for on this host, or `None` where no
+/// bundle is built: Linux and Windows on Arm use the QEMU the system provides
+/// (Homebrew, the distribution, or Scoop), and Intel Macs are not supported
+/// (Platform::current() rejects them first).
+fn host_target(platform: Platform) -> Option<&'static str> {
     match (platform.os, platform.arch) {
-        (Os::Mac, Arch::Aarch64) => "aarch64-apple-darwin",
-        (Os::Linux, Arch::X86_64) => "x86_64-unknown-linux-gnu",
-        (Os::Windows, Arch::X86_64) => "x86_64-pc-windows-gnu",
-        // Not supported hosts; Platform::current() rejects these first.
-        (Os::Mac, Arch::X86_64) | (Os::Linux | Os::Windows, Arch::Aarch64) => "unsupported",
+        (Os::Mac, Arch::Aarch64) => Some("aarch64-apple-darwin"),
+        (Os::Linux, Arch::X86_64) => Some("x86_64-unknown-linux-gnu"),
+        (Os::Windows, Arch::X86_64) => Some("x86_64-pc-windows-gnu"),
+        (Os::Mac, Arch::X86_64) | (Os::Linux | Os::Windows, Arch::Aarch64) => None,
     }
 }
 
@@ -78,7 +81,7 @@ pub fn target_for(platform: Platform) -> Option<&'static str> {
     if !host_os_supported(platform) {
         return None;
     }
-    let target = host_target(platform);
+    let target = host_target(platform)?;
     pinned_sha(target).map(|_| target)
 }
 

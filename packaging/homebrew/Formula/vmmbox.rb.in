@@ -21,22 +21,25 @@ class Vmmbox < Formula
     # Homebrew error instead of a missing download.
     depends_on arch: :arm64
 
-    url "@BASE_URL@/vmmbox-aarch64-apple-darwin"
-    sha256 "@SHA_MACOS_ARM64@"
+    on_arm do
+      url "@BASE_URL@/vmmbox-aarch64-apple-darwin"
+      sha256 "@SHA_MACOS_ARM64@"
+    end
   end
 
   on_linux do
-    # Only x86_64 is supported on Linux; this gives other architectures a clear
-    # Homebrew error instead of a missing download.
-    depends_on arch: :x86_64
-
     # On Linux QEMU and the virtio-fs server come from Homebrew or the system.
     depends_on "qemu"
     depends_on "virtiofsd"
 
+    # Homebrew on Linux runs on x86_64 and arm64 only, and both have a build.
     on_intel do
       url "@BASE_URL@/vmmbox-x86_64-unknown-linux-musl"
       sha256 "@SHA_LINUX_X86_64@"
+    end
+    on_arm do
+      url "@BASE_URL@/vmmbox-aarch64-unknown-linux-musl"
+      sha256 "@SHA_LINUX_ARM64@"
     end
   end
 

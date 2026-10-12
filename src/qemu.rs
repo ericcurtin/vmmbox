@@ -486,6 +486,9 @@ pub fn build_args(l: &Launch) -> Result<Vec<String>> {
 
     let (machine, accel, cpu) = match (l.platform.arch, l.platform.accel()) {
         (Arch::Aarch64, Accel::Hvf) => ("virt", "hvf", "host"),
+        (Arch::Aarch64, Accel::Kvm) => ("virt", "kvm", "host"),
+        // QEMU's WHPX documentation launches arm64 guests with `-M virt -cpu host`.
+        (Arch::Aarch64, Accel::Whpx) => ("virt", "whpx", "host"),
         (Arch::X86_64, Accel::Kvm) => ("q35", "kvm", "host"),
         // `host` isn't dependable under WHPX; `max` exposes what it supports.
         // kernel-irqchip=off avoids known WHPX interrupt-controller issues.
@@ -887,13 +890,40 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unsupported_combo_is_rejected() {
+    fn linux_arm_args() {
         let ep = Endpoint::Unix("/tmp/s.sock".into());
         let platform = Platform {
             os: Os::Linux,
             arch: Arch::Aarch64,
         };
-        assert!(build_args(&launch(platform, &ep, None)).is_err());
+        let share = Path::new("/tmp/s.vfs.sock");
+        let args = build_args(&launch(platform, &ep, Some(share))).unwrap();
+        assert!(has_pair(&args, "-machine", "virt,memory-backend=mem0"));
+        assert!(has_pair(&args, "-accel", "kvm"));
+        assert!(has_pair(&args, "-cpu", "host"));
+        // aarch64 guests need UEFI, and Linux shares RAM as memfd.
+        assert!(args.iter().any(|a| a.starts_with("if=pflash,")));
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("memory-backend-memfd,id=mem0"))
+        );
+        assert!(!args.iter().any(|a| a.contains("tcg")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn whpx_arm_args() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Windows,
+            arch: Arch::Aarch64,
+        };
+        let args = build_args(&launch(platform, &ep, None)).unwrap();
+        assert!(has_pair(&args, "-machine", "virt"));
+        assert!(has_pair(&args, "-accel", "whpx"));
+        assert!(has_pair(&args, "-cpu", "host"));
+        assert!(args.iter().any(|a| a.starts_with("if=pflash,")));
+        assert!(!args.iter().any(|a| a.contains("tcg")));
     }
 
     #[cfg(unix)]

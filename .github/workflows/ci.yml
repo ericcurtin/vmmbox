@@ -33,7 +33,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest, windows-latest]
+        # The -arm runners are native Arm: they test the Linux and Windows
+        # aarch64 builds that are released below.
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest, windows-latest, windows-11-arm]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -61,6 +63,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every target is built and smoke-tested on a runner of its own
+        # architecture (no cross-compiling), so what ships is what ran.
         include:
           - target: aarch64-apple-darwin
             runner: macos-latest
@@ -69,9 +73,15 @@ jobs:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
             asset: vmmbox-x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            asset: vmmbox-aarch64-unknown-linux-musl
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             asset: vmmbox-x86_64-pc-windows-msvc.exe
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            asset: vmmbox-aarch64-pc-windows-msvc.exe
     steps:
       # fetch-depth: 0 -- packaging/version.sh needs the full commit count.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -169,7 +179,8 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           for asset in vmmbox-aarch64-apple-darwin \
-                       vmmbox-x86_64-unknown-linux-musl vmmbox-x86_64-pc-windows-msvc.exe; do
+                       vmmbox-x86_64-unknown-linux-musl vmmbox-aarch64-unknown-linux-musl \
+                       vmmbox-x86_64-pc-windows-msvc.exe vmmbox-aarch64-pc-windows-msvc.exe; do
             printf '%s  %s\n' "$(printf '%s' "$asset" | sha256sum | cut -d' ' -f1)" "$asset"
           done > checksums.txt
           packaging/render.sh --version "$VERSION" --checksums checksums.txt --out-dir rendered
@@ -178,8 +189,18 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          jq -e --arg v "$VERSION" '.version == $v and .bin == "vmmbox.exe"' rendered/scoop/bucket/vmmbox.json
+          jq -e --arg v "$VERSION" '
+            .version == $v and .bin == "vmmbox.exe"
+            and (.architecture | keys == ["64bit", "arm64"])
+            and (.autoupdate.architecture | keys == ["64bit", "arm64"])
+          ' rendered/scoop/bucket/vmmbox.json
           ruby -c rendered/homebrew/Formula/vmmbox.rb
+          # Every release asset the formula and manifest name must have been hashed.
+          for asset in vmmbox-aarch64-apple-darwin vmmbox-x86_64-unknown-linux-musl \
+                       vmmbox-aarch64-unknown-linux-musl vmmbox-x86_64-pc-windows-msvc.exe \
+                       vmmbox-aarch64-pc-windows-msvc.exe; do
+            grep -rqF "/$asset" rendered || { echo "::error::no rendered package downloads $asset"; exit 1; }
+          done
           ! grep -rn '@[A-Z_]\{2,\}@' rendered
 
   # --------------------------------------------------------------------------
@@ -274,7 +295,9 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          for asset in vmmbox-aarch64-apple-darwin vmmbox-x86_64-unknown-linux-musl vmmbox-x86_64-pc-windows-msvc.exe; do
+          for asset in vmmbox-aarch64-apple-darwin \
+                       vmmbox-x86_64-unknown-linux-musl vmmbox-aarch64-unknown-linux-musl \
+                       vmmbox-x86_64-pc-windows-msvc.exe vmmbox-aarch64-pc-windows-msvc.exe; do
             [ -s "$asset" ] || { echo "::error::release asset $asset is missing or empty"; exit 1; }
           done
           chmod +x vmmbox-x86_64-unknown-linux-musl

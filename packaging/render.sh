@@ -95,7 +95,9 @@ sha_for() {
 
 SHA_MACOS_ARM64="$(sha_for vmmbox-aarch64-apple-darwin)"
 SHA_LINUX_X86_64="$(sha_for vmmbox-x86_64-unknown-linux-musl)"
+SHA_LINUX_ARM64="$(sha_for vmmbox-aarch64-unknown-linux-musl)"
 SHA_WINDOWS_X86_64="$(sha_for vmmbox-x86_64-pc-windows-msvc.exe)"
+SHA_WINDOWS_ARM64="$(sha_for vmmbox-aarch64-pc-windows-msvc.exe)"
 
 # `|` as the sed delimiter since several values are URLs; no value can contain
 # a placeholder (the description is checked above).
@@ -108,7 +110,9 @@ render() {
 		-e "s|@BASE_URL@|$BASE_URL|g" \
 		-e "s|@SHA_MACOS_ARM64@|$SHA_MACOS_ARM64|g" \
 		-e "s|@SHA_LINUX_X86_64@|$SHA_LINUX_X86_64|g" \
+		-e "s|@SHA_LINUX_ARM64@|$SHA_LINUX_ARM64|g" \
 		-e "s|@SHA_WINDOWS_X86_64@|$SHA_WINDOWS_X86_64|g" \
+		-e "s|@SHA_WINDOWS_ARM64@|$SHA_WINDOWS_ARM64|g" \
 		"$1"
 }
 

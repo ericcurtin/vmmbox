@@ -9,12 +9,17 @@
         "64bit": {
             "url": "@BASE_URL@/vmmbox-x86_64-pc-windows-msvc.exe#/vmmbox.exe",
             "hash": "@SHA_WINDOWS_X86_64@"
+        },
+        "arm64": {
+            "url": "@BASE_URL@/vmmbox-aarch64-pc-windows-msvc.exe#/vmmbox.exe",
+            "hash": "@SHA_WINDOWS_ARM64@"
         }
     },
     "bin": "vmmbox.exe",
     "notes": [
         "Virtual machines run under the Windows Hypervisor Platform. If `vmmbox start` reports that WHPX is unavailable, enable it from an administrator PowerShell and reboot:",
         "    Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform",
+        "On Windows on Arm, WHPX needs Windows 11 24H2 with the April 2025 optional update or the May 2025 security update (or later).",
         "vmmbox also uses the Windows OpenSSH client (Settings > Optional features) and curl.exe, which ships with Windows 10 and later.",
         "Sharing your home directory and GUI apps are not supported on Windows yet."
     ],
@@ -25,6 +30,9 @@
         "architecture": {
             "64bit": {
                 "url": "https://github.com/@REPO@/releases/download/v$version/vmmbox-x86_64-pc-windows-msvc.exe#/vmmbox.exe"
+            },
+            "arm64": {
+                "url": "https://github.com/@REPO@/releases/download/v$version/vmmbox-aarch64-pc-windows-msvc.exe#/vmmbox.exe"
             }
         },
         "hash": {

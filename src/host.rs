@@ -52,11 +52,14 @@ impl Accel {
     }
 }
 
-/// The host platforms vmmbox supports. macOS is Apple silicon only.
+/// The host platforms vmmbox supports: Linux and Windows on either
+/// architecture, macOS on Apple silicon only.
 const SUPPORTED: &[(Os, Arch)] = &[
     (Os::Mac, Arch::Aarch64),
     (Os::Linux, Arch::X86_64),
+    (Os::Linux, Arch::Aarch64),
     (Os::Windows, Arch::X86_64),
+    (Os::Windows, Arch::Aarch64),
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -85,7 +88,8 @@ impl Platform {
         };
         if !SUPPORTED.contains(&(os, arch)) {
             bail!(
-                "unsupported host: {} on {} (supported: macOS aarch64, Linux x86_64, Windows x86_64)",
+                "unsupported host: {} on {} (supported: macOS aarch64, Linux x86_64/aarch64, \
+                 Windows x86_64/aarch64)",
                 os.name(),
                 arch.as_str()
             );
@@ -297,7 +301,9 @@ mod tests {
             &[
                 (Os::Mac, Arch::Aarch64),
                 (Os::Linux, Arch::X86_64),
-                (Os::Windows, Arch::X86_64)
+                (Os::Linux, Arch::Aarch64),
+                (Os::Windows, Arch::X86_64),
+                (Os::Windows, Arch::Aarch64)
             ]
         );
     }
@@ -321,7 +327,7 @@ mod tests {
     #[test]
     fn support_matrix() {
         assert!(SUPPORTED.contains(&(Os::Mac, Arch::Aarch64)));
-        assert!(!SUPPORTED.contains(&(Os::Linux, Arch::Aarch64)));
-        assert!(!SUPPORTED.contains(&(Os::Windows, Arch::Aarch64)));
+        assert!(SUPPORTED.contains(&(Os::Linux, Arch::Aarch64)));
+        assert!(SUPPORTED.contains(&(Os::Windows, Arch::Aarch64)));
     }
 }
