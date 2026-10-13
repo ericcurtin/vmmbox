@@ -7,7 +7,7 @@
 #       it, stops it gracefully, boots it again to check its disk survived,
 #       stops it again and removes it.
 # nohw  For runners with no hypervisor: pulls the image for this architecture
-#       and checks that `start` fails with a clear error, not a crash. Warns if
+#       and checks that `run` fails with a clear error, not a crash. Warns if
 #       the VM boots after all, so the platform can be moved to `boot`.
 #
 # Everything lives under a scratch VMMBOX_HOME.
@@ -54,7 +54,7 @@ fail() {
 # vmmbox with stdin closed, so ssh never waits on ours.
 vm() { "$vmmbox" "$@" </dev/null; }
 # Like `vm`, but shows the output as it is produced and also returns it on
-# stdout. It goes through a file, not a pipe: on Windows the QEMU that `start`
+# stdout. It goes through a file, not a pipe: on Windows the QEMU that `run`
 # leaves running inherits a pipe's write end, so a pipe would not reach EOF
 # until the VM stopped.
 vmo() {
@@ -77,11 +77,11 @@ start_vm() {
 	local attempt=1 out rc
 	while :; do
 		rc=0
-		out="$(vmo start "$distro")" || rc=$?
+		out="$(vmo run "$distro")" || rc=$?
 		if [ "$rc" -ne 0 ] && [ "$attempt" -lt 3 ] && [ -n "$retry_start_on" ] &&
 			grep -Eq "$retry_start_on" <<<"$out"; then
 			attempt=$((attempt + 1))
-			printf '::warning::start hit a known flake of this runner (%s): retrying, attempt %s of 3.\n' "$retry_start_on" "$attempt" >&2
+			printf '::warning::run hit a known flake of this runner (%s): retrying, attempt %s of 3.\n' "$retry_start_on" "$attempt" >&2
 			continue
 		fi
 		printf '%s' "$out"
@@ -105,7 +105,7 @@ boot_vm() {
 	grep -q "Started $distro" <<<"$out" || fail "the VM did not start"
 	grep -qi "$accel accelerated" <<<"$out" || fail "the VM did not start with $accel acceleration"
 	[ -z "${E2E_EXPECT_WARNING:-}" ] || grep -q "$E2E_EXPECT_WARNING" <<<"$out" ||
-		fail "start did not warn: '$E2E_EXPECT_WARNING'"
+		fail "run did not warn: '$E2E_EXPECT_WARNING'"
 }
 
 stop_vm() {
@@ -169,17 +169,17 @@ if [ "$mode" = nohw ]; then
 		"$VMMBOX_HOME/bin/qemu-system-aarch64" --version || fail "the QEMU bundle does not run"
 	fi
 
-	step "start without a hypervisor must fail cleanly"
+	step "run without a hypervisor must fail cleanly"
 	rc=0
-	out="$(vmo start "$distro")" || rc=$?
+	out="$(vmo run "$distro")" || rc=$?
 	if [ "$rc" -eq 0 ]; then
 		printf '::warning::the %s VM booted on a runner expected to have no hypervisor: set mode: boot for it in ci.yml.\n' "$distro"
 		vm stop "$distro" || printf '::warning::could not stop it cleanly.\n'
 		exit 0
 	fi
 	! grep -qi 'panicked' <<<"$out" || fail "vmmbox panicked instead of reporting the missing hypervisor"
-	grep -Eqi "$nohw_error" <<<"$out" || fail "start failed, but not with a message matching '$nohw_error'"
-	echo "OK: start refused with an actionable error"
+	grep -Eqi "$nohw_error" <<<"$out" || fail "run failed, but not with a message matching '$nohw_error'"
+	echo "OK: run refused with an actionable error"
 	exit 0
 fi
 
@@ -231,8 +231,8 @@ stop_vm
 # new server. (Windows has no share, and its runner has no sound device anyway.)
 if [ "$windows" = 0 ]; then
 	step "an unusable sound backend: the VM starts without sound, home still shared"
-	out="$(VMMBOX_AUDIO=bogus vmo start "$distro")"
-	grep -q 'could not start with sound' <<<"$out" || fail "start did not fall back from the broken sound backend"
+	out="$(VMMBOX_AUDIO=bogus vmo run "$distro")"
+	grep -q 'could not start with sound' <<<"$out" || fail "run did not fall back from the broken sound backend"
 	grep -q "Started $distro" <<<"$out" || fail "the VM did not start without sound"
 	[ "$(cd "$home_work" && guest cat host.txt)" = from-host ] || fail "the home share is broken after the fallback"
 	stop_vm

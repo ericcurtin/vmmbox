@@ -167,7 +167,7 @@ fn parse_kernel(release: &str) -> Option<(u32, u32)> {
 }
 
 /// Decide whether the guest gets a GPU. `Err` carries the reason it does not,
-/// which `vmmbox start` shows.
+/// which `vmmbox run <distro>` shows.
 ///
 /// A GPU QEMU cannot use is worse than none: without a usable render node QEMU
 /// refuses to start at all. So every requirement is checked up front.
@@ -638,7 +638,7 @@ pub fn build_args(l: &Launch) -> Result<Vec<String>> {
     Ok(a.0)
 }
 
-/// Start QEMU detached from this process: it must outlive `vmmbox start`, and
+/// Start QEMU detached from this process: it must outlive `vmmbox run`, and
 /// must not die with the terminal. Output goes to `log`.
 pub fn spawn(qemu: &Qemu, args: &[String], log: &Path) -> Result<Child> {
     let mut cmd = Command::new(&qemu.system);

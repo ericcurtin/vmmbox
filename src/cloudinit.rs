@@ -211,7 +211,7 @@ impl Seed<'_> {
         // PipeWire runs as socket-activated user units. Make sure they are
         // enabled, keep the user's systemd manager running from boot (a fresh
         // SSH session otherwise races the manager's start-up), and restart it
-        // now: `vmmbox start` probes SSH while packages are still installing,
+        // now: `vmmbox run` probes SSH while packages are still installing,
         // so a manager started by a probe never saw the new unit files.
         run.push(
             "[ sh, -c, \"systemctl --global enable pipewire.socket pipewire-pulse.socket wireplumber.service || true\" ]"

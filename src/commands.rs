@@ -190,7 +190,7 @@ pub fn ps(all: bool) -> Result<()> {
     }
     if shown == 0 {
         if vms.is_empty() {
-            println!("No VMs. Create one with `vmmbox start <distro>`.");
+            println!("No VMs. Create one with `vmmbox run <distro>`.");
         } else {
             println!("No running VMs. Use `vmmbox ls` to list stopped ones.");
         }
@@ -204,7 +204,7 @@ pub fn ps(all: bool) -> Result<()> {
 fn existing_vm(paths: &Paths, r: &ImageRef) -> Result<Vm> {
     let name = r.distro.name;
     let vm = vm::load(paths, name)?
-        .with_context(|| format!("no VM named '{name}'; create it with `vmmbox start {name}`"))?;
+        .with_context(|| format!("no VM named '{name}'; create it with `vmmbox run {name}`"))?;
     check_version(&vm, r)?;
     Ok(vm)
 }
@@ -224,22 +224,7 @@ fn check_version(vm: &Vm, r: &ImageRef) -> Result<()> {
     Ok(())
 }
 
-pub fn start(r: &ImageRef) -> Result<()> {
-    let platform = Platform::current()?;
-    let paths = Paths::discover()?;
-    let (vm, booted) = ensure_running(&paths, platform, r)?;
-    match booted {
-        Some(b) => print_summary(&paths, platform, &vm, &b),
-        None => {
-            if let Some(pid) = vm.running_pid() {
-                println!("{} is already running (pid {pid})", vm.state.name);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// What booting a VM did, for the summary `start` prints.
+/// What booting a VM did, for the summary `run` prints without a command.
 struct Booted {
     elapsed: Duration,
     gpu: std::result::Result<Gpu, String>,
@@ -774,6 +759,14 @@ pub fn run(r: &ImageRef, command: &[String], mode: GuiMode, x11: bool) -> Result
     // The VM is pulled, created and started first if that is still to do.
     let (vm, booted) = ensure_running(&paths, platform, r)?;
     let name = &vm.state.name;
+    if command.is_empty() {
+        match (&booted, vm.running_pid()) {
+            (Some(b), _) => print_summary(&paths, platform, &vm, b),
+            (None, Some(pid)) => println!("{name} is already running (pid {pid})"),
+            (None, None) => {}
+        }
+        return Ok(0);
+    }
     let ssh = Ssh::for_vm(&vm)?;
     match booted {
         Some(b) => eprintln!("Started {name} in {}s", b.elapsed.as_secs()),
