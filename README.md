@@ -13,7 +13,8 @@ Supported hosts: macOS on Apple silicon, Linux and Windows on x86_64 or aarch64.
 ```
 vmmbox run ubuntu bash    # pulls, creates and starts the VM as needed
                           # (or ubuntu:24.04, fedora:44)
-vmmbox ls                 # also: ps, images, pull, start, stop, rm, rmi
+vmmbox run fedora         # no command: just start the VM
+vmmbox ls                 # also: ps, images, pull, stop, rm, rmi
 ```
 
 Apache-2.0, see [LICENSE](LICENSE).

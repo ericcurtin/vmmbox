@@ -17,7 +17,7 @@
     },
     "bin": "vmmbox.exe",
     "notes": [
-        "Virtual machines run under the Windows Hypervisor Platform. If `vmmbox start` reports that WHPX is unavailable, enable it from an administrator PowerShell and reboot:",
+        "Virtual machines run under the Windows Hypervisor Platform. If `vmmbox run` reports that WHPX is unavailable, enable it from an administrator PowerShell and reboot:",
         "    Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform",
         "On Windows on Arm, WHPX needs Windows 11 24H2 with the April 2025 optional update or the May 2025 security update (or later).",
         "vmmbox also uses the Windows OpenSSH client (Settings > Optional features) and curl.exe, which ships with Windows 10 and later.",

@@ -144,7 +144,7 @@ jobs:
   # ubuntu-24.04 (KVM, once a udev rule opens /dev/kvm) and windows-latest
   # (WHPX). ubuntu-24.04-arm has no /dev/kvm, macos-latest reports
   # kern.hv_support 0, and windows-11-arm has WHPX off (enabling it needs a
-  # reboot). Those `nohw` legs pull the image and check that `start` fails with
+  # reboot). Those `nohw` legs pull the image and check that `run` fails with
   # a clear error, and warn if a runner can boot after all. See ci/e2e.sh.
   e2e:
     name: E2E ${{ matrix.target }} (${{ matrix.mode }}${{ matrix.packages == 'apt' && ', distro packages' || '' }})
@@ -204,7 +204,7 @@ jobs:
         timeout-minutes: 25
         shell: bash
         env:
-          # Old virtiofsd: start must warn that it runs without id translation.
+          # Old virtiofsd: run must warn that it runs without id translation.
           E2E_EXPECT_WARNING: ${{ matrix.packages == 'apt' && 'cannot translate guest user ids' || '' }}
         run: ci/e2e.sh "${{ matrix.mode }}" dist/* "${{ matrix.target }}"
 

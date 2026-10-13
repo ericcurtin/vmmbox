@@ -41,37 +41,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the VM for a distro, creating it on first use (e.g. ubuntu, ubuntu:24.04, fedora:44)
-    Start {
-        /// Distro, optionally with a version: distro[:version]
-        image: ImageRef,
-    },
     /// Shut a VM down
     Stop {
         /// Distro name of the VM
         name: ImageRef,
     },
     /// Run a command in a VM as your user, in your current directory. The VM is
-    /// pulled, created and started first if need be. GUI apps (e.g.
-    /// google-chrome) open as windows on your desktop.
+    /// pulled, created and started first if need be; with no command, that is
+    /// all. GUI apps (e.g. google-chrome) open as windows on your desktop.
     // `exec` was this command's name in 0.1.x; it keeps working, unlisted.
     #[command(alias = "exec")]
     Run {
         /// Open as a GUI app even if vmmbox doesn't recognise the command as one
         /// (needed to start GUI apps from a shell: `run --gui ubuntu bash`)
-        #[arg(long)]
+        #[arg(long, requires = "command")]
         gui: bool,
         /// Never forward windows; run as a plain terminal command
-        #[arg(long, conflicts_with = "gui")]
+        #[arg(long, conflicts_with = "gui", requires = "command")]
         no_gui: bool,
         /// Also give the app an X server, for software with no Wayland support.
         /// Automatic for VLC and the classic X utilities. Implies --gui
-        #[arg(long, conflicts_with = "no_gui")]
+        #[arg(long, conflicts_with = "no_gui", requires = "command")]
         x11: bool,
-        /// Distro name of the VM
+        /// Distro, optionally with a version: distro[:version]
         name: ImageRef,
-        /// Command and arguments to run
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Command and arguments to run (none: just start the VM)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
     /// List pulled images
@@ -123,7 +118,6 @@ enum Command {
 
 fn run(cli: Cli) -> anyhow::Result<i32> {
     match cli.command {
-        Command::Start { image } => commands::start(&image).map(|()| 0),
         Command::Stop { name } => commands::stop(&name).map(|()| 0),
         Command::Run {
             gui,
@@ -213,6 +207,30 @@ mod tests {
             parse(&["run", "--gui", "ubuntu", "bash"]),
             Command::Run { gui: true, .. }
         ));
+    }
+
+    #[test]
+    fn run_with_only_a_vm_has_no_command() {
+        for (arg, version) in [("fedora", None), ("fedora:44", Some("44"))] {
+            let Command::Run { name, command, .. } = parse(&["run", arg]) else {
+                panic!("not run");
+            };
+            assert_eq!(name.version.as_deref(), version);
+            assert!(command.is_empty());
+        }
+    }
+
+    #[test]
+    fn gui_flags_need_a_command_to_apply_to() {
+        for flag in ["--gui", "--no-gui", "--x11"] {
+            assert!(Cli::try_parse_from(["vmmbox", "run", flag, "fedora"]).is_err());
+            assert!(Cli::try_parse_from(["vmmbox", "run", flag, "fedora", "bash"]).is_ok());
+        }
+    }
+
+    #[test]
+    fn start_is_gone() {
+        assert!(Cli::command().find_subcommand("start").is_none());
     }
 
     #[test]
