@@ -25,8 +25,9 @@ use std::time::{Duration, Instant};
 
 /// How long to wait for a guest to accept SSH after QEMU starts.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(300);
-/// How long to give a guest to power off after a shutdown request.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to give a guest to power off. Must outlast systemd's stop timeout
+/// for a stuck service (90s, plus slack), or one slow unit forces a power-off.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// `vmmbox setup`: install the QEMU build vmmbox ships for this machine.
 pub fn setup() -> Result<()> {
