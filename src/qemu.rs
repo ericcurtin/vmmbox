@@ -93,27 +93,61 @@ pub struct Audio {
 }
 
 /// A paravirtual GPU backed by the host's real one (virtio-gpu with
-/// virglrenderer). Linux hosts only: elsewhere upstream QEMU cannot give a
-/// Linux guest an accelerated GPU.
+/// virglrenderer). On Linux that is the host's DRM render node. On macOS there
+/// is no OpenGL: Vulkan (Venus) runs on Metal through KosmicKrisp, which has
+/// to sit beside QEMU (`<prefix>/share/vulkan`, `<prefix>/lib`). Elsewhere upstream QEMU cannot give a Linux guest an
+/// accelerated GPU.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Gpu {
-    /// The DRM render node QEMU draws on, e.g. `/dev/dri/renderD128`.
-    pub render_node: PathBuf,
+    /// The DRM render node QEMU draws on, e.g. `/dev/dri/renderD128`. `None`
+    /// on macOS, where there is no display for it to draw on.
+    pub render_node: Option<PathBuf>,
     /// Vulkan (Venus) as well as OpenGL (virgl).
     pub vulkan: bool,
+    /// The Vulkan driver QEMU's virglrenderer loads (macOS only).
+    pub driver: Option<HostVulkan>,
+}
+
+/// A Vulkan loader and driver that ship next to QEMU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostVulkan {
+    /// The driver's ICD manifest (`VK_DRIVER_FILES`).
+    pub icd: PathBuf,
+    /// Where the Vulkan loader lives: virglrenderer opens it by name.
+    pub lib_dir: PathBuf,
 }
 
 impl Gpu {
     pub fn describe(&self) -> String {
-        format!(
-            "{} via {}",
-            if self.vulkan {
-                "Vulkan and OpenGL"
-            } else {
-                "OpenGL"
-            },
-            self.render_node.display()
-        )
+        match (&self.render_node, &self.driver) {
+            (_, Some(_)) => "Vulkan on Metal via KosmicKrisp".into(),
+            (Some(node), None) => format!(
+                "{} via {}",
+                if self.vulkan {
+                    "Vulkan and OpenGL"
+                } else {
+                    "OpenGL"
+                },
+                node.display()
+            ),
+            (None, None) => "none".into(),
+        }
+    }
+
+    /// The environment QEMU needs to find the host's Vulkan driver.
+    pub fn env(&self) -> Vec<(&'static str, String)> {
+        let Some(d) = &self.driver else {
+            return Vec::new();
+        };
+        // virglrenderer dlopen()s "libvulkan.dylib" by name, which dyld looks
+        // for in the fallback path, not next to QEMU.
+        vec![
+            ("VK_DRIVER_FILES", d.icd.display().to_string()),
+            (
+                "DYLD_FALLBACK_LIBRARY_PATH",
+                format!("{}:/usr/local/lib:/usr/lib", d.lib_dir.display()),
+            ),
+        ]
     }
 }
 
@@ -130,11 +164,18 @@ struct GpuHost {
     kernel: Option<(u32, u32)>,
     /// Render nodes this user can open for reading and writing.
     render_nodes: Vec<PathBuf>,
+    /// macOS major version.
+    macos: Option<u32>,
+    /// The Vulkan loader and KosmicKrisp next to this QEMU.
+    driver: Option<HostVulkan>,
 }
 
 /// The oldest kernel on which virglrenderer can pass Vulkan through (host
 /// blob memory), per the QEMU documentation.
 const VENUS_MIN_KERNEL: (u32, u32) = (6, 13);
+
+/// KosmicKrisp is Vulkan on Metal 4, which is macOS 26.
+const KOSMICKRISP_MIN_MACOS: u32 = 26;
 
 /// How to treat the GPU, from `VMMBOX_GPU`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,7 +213,7 @@ fn parse_kernel(release: &str) -> Option<(u32, u32)> {
 /// A GPU QEMU cannot use is worse than none: without a usable render node QEMU
 /// refuses to start at all. So every requirement is checked up front.
 fn plan_gpu(os: Os, mode: GpuMode, host: &GpuHost) -> std::result::Result<Gpu, String> {
-    if os != Os::Linux {
+    if os == Os::Windows {
         return Err(format!(
             "none (QEMU cannot give a Linux guest an accelerated GPU on {})",
             os.name()
@@ -183,6 +224,9 @@ fn plan_gpu(os: Os, mode: GpuMode, host: &GpuHost) -> std::result::Result<Gpu, S
     }
     if !host.gl_device {
         return Err("none (this QEMU was built without virglrenderer)".into());
+    }
+    if os == Os::Mac {
+        return plan_gpu_mac(mode, host);
     }
     if !host.egl_headless {
         return Err("none (this QEMU has no egl-headless display)".into());
@@ -196,8 +240,32 @@ fn plan_gpu(os: Os, mode: GpuMode, host: &GpuHost) -> std::result::Result<Gpu, S
         && host.venus_option
         && host.kernel.is_some_and(|k| k >= VENUS_MIN_KERNEL);
     Ok(Gpu {
-        render_node: node.clone(),
+        render_node: Some(node.clone()),
         vulkan,
+        driver: None,
+    })
+}
+
+/// macOS: Vulkan only (there is no OpenGL to offer), through KosmicKrisp.
+fn plan_gpu_mac(mode: GpuMode, host: &GpuHost) -> std::result::Result<Gpu, String> {
+    if mode == GpuMode::OpenGl {
+        return Err("none (macOS offers Vulkan only, and VMMBOX_GPU=opengl leaves it out)".into());
+    }
+    if !host.venus_option {
+        return Err("none (this QEMU has no Venus support)".into());
+    }
+    if !host.macos.is_some_and(|v| v >= KOSMICKRISP_MIN_MACOS) {
+        return Err(format!(
+            "none (Vulkan on Metal needs macOS {KOSMICKRISP_MIN_MACOS} or newer)"
+        ));
+    }
+    let Some(driver) = &host.driver else {
+        return Err("none (this QEMU has no KosmicKrisp Vulkan driver)".into());
+    };
+    Ok(Gpu {
+        render_node: None,
+        vulkan: true,
+        driver: Some(driver.clone()),
     })
 }
 
@@ -315,7 +383,7 @@ impl Qemu {
     pub fn gpu(&self, os: Os) -> std::result::Result<Gpu, String> {
         let mode = gpu_mode(std::env::var("VMMBOX_GPU").ok().as_deref());
         // Don't ask QEMU anything on hosts that can never have one.
-        if os != Os::Linux || mode == GpuMode::Off {
+        if os == Os::Windows || mode == GpuMode::Off {
             return plan_gpu(os, mode, &GpuHost::default());
         }
         let gl_device = self.has_device("virtio-gpu-gl-pci");
@@ -333,8 +401,20 @@ impl Qemu {
                 .ok()
                 .and_then(|r| parse_kernel(&r)),
             render_nodes: usable_render_nodes(),
+            macos: sysinfo::System::os_version().and_then(|v| v.split('.').next()?.parse().ok()),
+            driver: self.host_vulkan(),
         };
         plan_gpu(os, mode, &host)
+    }
+
+    /// The Vulkan loader and KosmicKrisp driver in this QEMU's install prefix
+    /// (`<prefix>/bin/qemu-system-*`), if it has them.
+    fn host_vulkan(&self) -> Option<HostVulkan> {
+        let prefix = self.system.parent()?.parent()?;
+        let icd = prefix.join("share/vulkan/icd.d/kosmickrisp_icd.json");
+        let lib_dir = prefix.join("lib");
+        (icd.is_file() && lib_dir.join("libvulkan.dylib").exists())
+            .then_some(HostVulkan { icd, lib_dir })
     }
 
     /// Pick how to give the guest sound: the host OS's native audio backend
@@ -538,12 +618,13 @@ pub fn build_args(l: &Launch) -> Result<Vec<String>> {
 
     // No default devices: everything the guest sees is listed here.
     a.flag("-nodefaults");
-    match l.gpu {
+    match l.gpu.and_then(|g| g.render_node.as_ref()) {
         // Headless, but with an EGL context on the host GPU for virglrenderer.
-        Some(gpu) => a.kv(
+        Some(node) => a.kv(
             "-display",
-            format!("egl-headless,rendernode={}", path(&gpu.render_node)),
+            format!("egl-headless,rendernode={}", path(node)),
         ),
+        // Venus on macOS draws nothing on the host.
         None => a.kv("-display", "none".into()),
     }
 
@@ -640,9 +721,10 @@ pub fn build_args(l: &Launch) -> Result<Vec<String>> {
 
 /// Start QEMU detached from this process: it must outlive `vmmbox run`, and
 /// must not die with the terminal. Output goes to `log`.
-pub fn spawn(qemu: &Qemu, args: &[String], log: &Path) -> Result<Child> {
+pub fn spawn(qemu: &Qemu, args: &[String], gpu: Option<&Gpu>, log: &Path) -> Result<Child> {
     let mut cmd = Command::new(&qemu.system);
     cmd.args(args);
+    cmd.envs(gpu.map(Gpu::env).unwrap_or_default());
     crate::proc::spawn_detached(&mut cmd, log)
 }
 
@@ -859,8 +941,9 @@ mod tests {
             arch: Arch::X86_64,
         };
         let gpu = Gpu {
-            render_node: "/dev/dri/renderD128".into(),
+            render_node: Some("/dev/dri/renderD128".into()),
             vulkan: true,
+            driver: None,
         };
         let mut l = launch(platform, &ep, None);
         l.gpu = Some(&gpu);
@@ -888,14 +971,69 @@ mod tests {
             arch: Arch::X86_64,
         };
         let gpu = Gpu {
-            render_node: "/dev/dri/renderD129".into(),
+            render_node: Some("/dev/dri/renderD129".into()),
             vulkan: false,
+            driver: None,
         };
         let mut l = launch(platform, &ep, None);
         l.gpu = Some(&gpu);
         let args = build_args(&l).unwrap();
         assert!(has_pair(&args, "-device", "virtio-gpu-gl-pci"));
         assert!(!args.iter().any(|a| a.contains("venus")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_vulkan_runs_headless_and_finds_its_driver_through_the_environment() {
+        let ep = Endpoint::Unix("/tmp/s.sock".into());
+        let platform = Platform {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        };
+        let gpu = metal_gpu();
+        let mut l = launch(platform, &ep, None);
+        l.gpu = Some(&gpu);
+        let args = build_args(&l).unwrap();
+        // No display for it to draw on, and no render node to name.
+        assert!(has_pair(&args, "-display", "none"));
+        assert!(has_pair(
+            &args,
+            "-device",
+            "virtio-gpu-gl-pci,hostmem=4G,blob=true,venus=true"
+        ));
+        assert!(!args.iter().any(|a| a.contains("egl-headless")));
+        assert_eq!(
+            gpu.env(),
+            [
+                (
+                    "VK_DRIVER_FILES",
+                    "/d/share/vulkan/icd.d/kosmickrisp_icd.json".into()
+                ),
+                (
+                    "DYLD_FALLBACK_LIBRARY_PATH",
+                    "/d/lib:/usr/local/lib:/usr/lib".into()
+                ),
+            ]
+        );
+        // Only the Metal GPU has any environment.
+        let linux = Gpu {
+            render_node: Some("/dev/dri/renderD128".into()),
+            vulkan: true,
+            driver: None,
+        };
+        assert!(linux.env().is_empty());
+    }
+
+    #[cfg(unix)]
+    fn metal_gpu() -> Gpu {
+        Gpu {
+            render_node: None,
+            vulkan: true,
+            driver: Some(HostVulkan {
+                icd: "/d/share/vulkan/icd.d/kosmickrisp_icd.json".into(),
+                lib_dir: "/d/lib".into(),
+            }),
+        }
     }
 
     #[cfg(unix)]
@@ -1022,23 +1160,101 @@ mod gpu_tests {
             venus_option: true,
             kernel: Some((6, 14)),
             render_nodes: vec!["/dev/dri/renderD128".into(), "/dev/dri/renderD129".into()],
+            macos: None,
+            driver: None,
+        }
+    }
+
+    /// A QEMU bundle on a Mac that can run KosmicKrisp: no egl-headless (it
+    /// needs a render node), but the Vulkan driver beside it.
+    fn mac() -> GpuHost {
+        GpuHost {
+            egl_headless: false,
+            kernel: None,
+            render_nodes: vec![],
+            macos: Some(26),
+            driver: Some(HostVulkan {
+                icd: "/d/share/vulkan/icd.d/kosmickrisp_icd.json".into(),
+                lib_dir: "/d/lib".into(),
+            }),
+            ..capable()
         }
     }
 
     #[test]
     fn a_capable_linux_host_gets_vulkan_on_its_first_render_node() {
         let gpu = plan_gpu(Os::Linux, GpuMode::Auto, &capable()).unwrap();
-        assert_eq!(gpu.render_node, Path::new("/dev/dri/renderD128"));
+        assert_eq!(
+            gpu.render_node.as_deref(),
+            Some(Path::new("/dev/dri/renderD128"))
+        );
         assert!(gpu.vulkan);
         assert_eq!(gpu.describe(), "Vulkan and OpenGL via /dev/dri/renderD128");
     }
 
     #[test]
-    fn macos_and_windows_never_get_one() {
-        for os in [Os::Mac, Os::Windows] {
-            let why = plan_gpu(os, GpuMode::Auto, &capable()).unwrap_err();
-            assert!(why.contains(os.name()), "{why}");
+    fn windows_never_gets_one() {
+        let why = plan_gpu(Os::Windows, GpuMode::Auto, &capable()).unwrap_err();
+        assert!(why.contains("Windows"), "{why}");
+    }
+
+    #[test]
+    fn a_mac_gets_vulkan_on_metal_and_nothing_else() {
+        let gpu = plan_gpu(Os::Mac, GpuMode::Auto, &mac()).unwrap();
+        assert!(gpu.vulkan);
+        assert_eq!(gpu.render_node, None);
+        assert_eq!(gpu.describe(), "Vulkan on Metal via KosmicKrisp");
+        assert_eq!(gpu.driver, mac().driver);
+    }
+
+    #[test]
+    fn a_mac_that_cannot_run_kosmickrisp_says_why() {
+        for (host, needle) in [
+            (
+                GpuHost {
+                    macos: Some(15),
+                    ..mac()
+                },
+                "macOS 26",
+            ),
+            (
+                GpuHost {
+                    macos: None,
+                    ..mac()
+                },
+                "macOS 26",
+            ),
+            (
+                GpuHost {
+                    driver: None,
+                    ..mac()
+                },
+                "KosmicKrisp",
+            ),
+            (
+                GpuHost {
+                    venus_option: false,
+                    ..mac()
+                },
+                "Venus",
+            ),
+            (
+                GpuHost {
+                    gl_device: false,
+                    ..mac()
+                },
+                "virglrenderer",
+            ),
+        ] {
+            let why = plan_gpu(Os::Mac, GpuMode::Auto, &host).unwrap_err();
+            assert!(why.starts_with("none"), "{why}");
+            assert!(why.contains(needle), "{why}");
         }
+        // There is no OpenGL on a Mac to fall back to.
+        let why = plan_gpu(Os::Mac, GpuMode::OpenGl, &mac()).unwrap_err();
+        assert!(why.contains("Vulkan only"), "{why}");
+        let why = plan_gpu(Os::Mac, GpuMode::Off, &mac()).unwrap_err();
+        assert!(why.contains("VMMBOX_GPU"), "{why}");
     }
 
     #[test]

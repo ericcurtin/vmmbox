@@ -229,6 +229,28 @@ fn check_version(vm: &Vm, r: &ImageRef) -> Result<()> {
 struct Booted {
     elapsed: Duration,
     gpu: std::result::Result<Gpu, String>,
+    /// Why the guest cannot use the GPU, if it cannot.
+    gpu_warning: Option<&'static str>,
+}
+
+/// Exits 0 on a Linux of 7.2 or later. With 16 KiB pages on the host (Apple
+/// silicon), GPU memory has to be mapped into the guest in units that large, and
+/// earlier kernels neither know nor ask for that: Vulkan then fails to start.
+const KERNEL_MAPS_GPU_MEMORY: &str =
+    "uname -r | awk -F'[.-]' '{ exit !($1 > 7 || ($1 == 7 && $2 >= 2)) }'";
+
+/// What to tell the user about a GPU the guest cannot use, or `None` if it can,
+/// or if it is not the one that depends on the guest kernel.
+fn guest_gpu_warning(gpu: &std::result::Result<Gpu, String>, ssh: &Ssh) -> Option<&'static str> {
+    gpu.as_ref().ok().filter(|g| g.driver.is_some())?;
+    // Not knowing is not a reason to alarm.
+    match ssh.run_quiet(KERNEL_MAPS_GPU_MEMORY) {
+        Ok(code) if code != 0 => Some(
+            "the guest kernel is older than Linux 7.2, which it needs to use the GPU, so Vulkan \
+             falls back to the CPU; see the README",
+        ),
+        _ => None,
+    }
 }
 
 /// Make sure the VM for `r` is running: pull its image, create the VM and boot
@@ -391,7 +413,7 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
         format_bytes(compute.memory_bytes),
         platform.accel().name().to_uppercase()
     );
-    let mut child = qemu::spawn(qemu, &args, &vm.qemu_log())?;
+    let mut child = qemu::spawn(qemu, &args, gpu.as_ref().ok(), &vm.qemu_log())?;
 
     vm.state.pid = Some(child.id());
     vm.state.ssh_port = ssh_port;
@@ -445,6 +467,7 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
                 child = qemu::spawn(
                     qemu,
                     &args_for(gpu.as_ref().ok(), audio.as_ref())?,
+                    gpu.as_ref().ok(),
                     &vm.qemu_log(),
                 )?;
                 vm.state.pid = Some(child.id());
@@ -521,9 +544,11 @@ fn boot(paths: &Paths, platform: Platform, qemu: &Qemu, vm: &mut Vm) -> Result<B
     }
 
     fsd.disarm();
+    let gpu_warning = guest_gpu_warning(&gpu, &ssh);
     Ok(Booted {
         elapsed: started.elapsed(),
         gpu,
+        gpu_warning,
     })
 }
 
@@ -566,6 +591,9 @@ fn print_summary(paths: &Paths, platform: Platform, vm: &Vm, booted: &Booted) {
     match &booted.gpu {
         Ok(g) => println!("  GPU:    {}", g.describe()),
         Err(why) => println!("  GPU:    {why}"),
+    }
+    if let Some(warning) = booted.gpu_warning {
+        println!("          warning: {warning}");
     }
     println!("  User:   {} (uid {}, gid {})", s.user, s.uid, s.gid);
     if s.home_shared && s.guest_home == s.host_home {
