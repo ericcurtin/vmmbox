@@ -18,6 +18,9 @@ pub enum Family {
     /// CentOS Stream. Their kernels have no 9p, which is why they were once
     /// dropped; the host home is shared over virtio-fs, which every kernel has.
     Rhel,
+    /// AgenticLinux, a bootc OS: its root is read-only, so nothing is installed
+    /// at first boot; the image has what the guest needs.
+    AgenticLinux,
 }
 
 #[derive(Debug)]
@@ -67,10 +70,37 @@ pub const DISTROS: &[Distro] = &[
         family: Family::Rhel,
         default_version: "10",
     },
+    Distro {
+        name: "agenticlinux",
+        aliases: &[],
+        family: Family::AgenticLinux,
+        default_version: "base",
+    },
 ];
 
 /// RHEL major versions with published generic cloud images.
 const RHEL_VERSIONS: &[&str] = &["9", "10"];
+
+/// The AgenticLinux variants with a cloud-init qcow2 in its releases.
+const AGENTICLINUX_VARIANTS: &[&str] = &[
+    "base",
+    "kde",
+    "gnome",
+    "sway",
+    "cosmic",
+    "xfce",
+    "budgie",
+    "fedora44-base",
+    "fedora44-kde",
+    "fedora44-gnome",
+    "fedora44-sway",
+    "fedora44-cosmic",
+    "fedora44-xfce",
+    "fedora44-budgie",
+    "centos-base",
+    "centos-kde",
+    "centos-gnome",
+];
 
 /// Debian release number -> suite name used in cloud.debian.org paths.
 const DEBIAN_SUITES: &[(&str, &str)] = &[("12", "bookworm"), ("13", "trixie")];
@@ -153,6 +183,7 @@ impl Family {
             // in EPEL rather than the base repositories, and the kernels' sound
             // support is untested. Home sharing and the shell work.
             Family::Rhel => &[],
+            Family::AgenticLinux => &[], // in the image
         }
     }
 
@@ -179,6 +210,7 @@ impl Family {
                 "xorg-x11-server-Xwayland",
             ],
             Family::Rhel => &[],
+            Family::AgenticLinux => &[], // in the image
         }
     }
 
@@ -193,7 +225,7 @@ impl Family {
                  apt-get install -y -qq \"linux-modules-extra-$(uname -r)\"",
             ),
             Family::Fedora => Some("dnf install -y -q \"kernel-modules-$(uname -r)\""),
-            Family::Debian | Family::Rhel => None,
+            Family::Debian | Family::Rhel | Family::AgenticLinux => None,
         }
     }
 
@@ -207,6 +239,7 @@ impl Family {
             Family::Debian => DEBIAN_SUITES.iter().any(|(n, _)| *n == v),
             Family::Fedora => all_digits(v),
             Family::Rhel => RHEL_VERSIONS.contains(&v),
+            Family::AgenticLinux => AGENTICLINUX_VARIANTS.contains(&v),
         };
         if ok {
             return Ok(());
@@ -226,6 +259,10 @@ impl Family {
                 RHEL_VERSIONS.join(", ")
             ),
             Family::Fedora => bail!("invalid version '{v}' (expected a release number such as 44)"),
+            Family::AgenticLinux => bail!(
+                "unknown AgenticLinux variant '{v}' (available: {})",
+                AGENTICLINUX_VARIANTS.join(", ")
+            ),
         }
     }
 }
@@ -254,6 +291,7 @@ impl Distro {
                 fedora_source(&listing, &base, version, arch)
             }
             Family::Rhel => rhel_source(self.name, version, arch),
+            Family::AgenticLinux => Ok(agenticlinux_source(version, arch)),
             family => static_source(family, version, arch),
         }
     }
@@ -291,6 +329,19 @@ fn rhel_source(distro: &str, v: &str, arch: Arch) -> Result<Source> {
     })
 }
 
+/// A small cloud-init disk per variant and architecture (the full image is over
+/// a release asset's 2 GiB) that stages the full OS for the next boot, with its
+/// checksum in a file beside it.
+fn agenticlinux_source(variant: &str, arch: Arch) -> Source {
+    let file = format!("agenticlinux-{variant}-{}.qcow2", arch.as_str());
+    simple(
+        "https://github.com/agenticlinux/agenticlinux/releases/latest/download/",
+        &file,
+        &format!("{file}.sha256"),
+        Algo::Sha256,
+    )
+}
+
 fn simple(url_dir: &str, file: &str, sums: &str, algo: Algo) -> Source {
     Source {
         url: format!("{url_dir}{file}"),
@@ -326,6 +377,7 @@ pub fn static_source(family: Family, v: &str, arch: Arch) -> Result<Source> {
         }
         Family::Fedora => bail!("Fedora sources are resolved from the release listing"),
         Family::Rhel => bail!("RHEL-family sources depend on the distro, not just the family"),
+        Family::AgenticLinux => bail!("AgenticLinux sources are not a template of a version"),
     })
 }
 
@@ -496,6 +548,54 @@ mod tests {
         );
         let want = "CentOS-Stream-GenericCloud-10-latest.aarch64.qcow2";
         assert_eq!(find_checksum(&centos, want, Algo::Sha256), Some(h('d')));
+    }
+
+    #[test]
+    fn agenticlinux_references() {
+        let r = parse("agenticlinux").unwrap();
+        assert_eq!(r.distro.family, Family::AgenticLinux);
+        assert_eq!(r.version_or_default(), "base");
+        for v in ["kde", "fedora44-gnome", "centos-base"] {
+            let r = parse(&format!("agenticlinux:{v}")).unwrap();
+            assert_eq!(r.version.as_deref(), Some(v));
+        }
+        for bad in [
+            "agenticlinux:45",
+            "agenticlinux:fedora45-kde",
+            "agenticlinux:centos-sway",
+            "agenticlinux:16k-kde",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(
+            parse("agenticlinux:nope")
+                .unwrap_err()
+                .to_string()
+                .contains("fedora44-kde")
+        );
+    }
+
+    #[test]
+    fn agenticlinux_urls() {
+        let s = agenticlinux_source("kde", Arch::X86_64);
+        assert_eq!(
+            s.url,
+            "https://github.com/agenticlinux/agenticlinux/releases/latest/download/agenticlinux-kde-x86_64.qcow2"
+        );
+        assert_eq!(s.checksum_url, format!("{}.sha256", s.url));
+        assert_eq!(s.file_name, "agenticlinux-kde-x86_64.qcow2");
+        let s = agenticlinux_source("fedora44-base", Arch::Aarch64);
+        assert!(s.url.ends_with("/agenticlinux-fedora44-base-aarch64.qcow2"));
+        // The release's `.sha256` is `sha256sum`'s output: hash, two spaces, name.
+        let line = format!("{}  {}\n", "a".repeat(64), s.file_name);
+        assert_eq!(
+            crate::checksum::find_checksum(&line, &s.file_name, Algo::Sha256),
+            Some("a".repeat(64))
+        );
+        // Nothing is installed on its read-only root at first boot.
+        assert!(Family::AgenticLinux.audio_packages().is_empty());
+        assert!(Family::AgenticLinux.gui_packages().is_empty());
+        assert_eq!(Family::AgenticLinux.kernel_modules_cmd(), None);
     }
 
     #[test]
