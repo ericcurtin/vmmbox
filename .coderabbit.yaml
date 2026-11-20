@@ -15,6 +15,7 @@ reviews:
   estimate_code_review_effort: false
   # No status noise
   review_status: false
+  commit_status: false
   review_info: false
   review_details: false
   review_progress: false
