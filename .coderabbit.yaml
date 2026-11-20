@@ -1,0 +1,61 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit config for this repository.
+# Goal: stay quiet. Only inline comments on important issues. No summaries,
+# no PR description edits, no labels, no extras.
+language: en-US
+early_access: false
+reviews:
+  profile: quiet
+  request_changes_workflow: false
+  # No PR description edits / summaries / titles
+  high_level_summary: false
+  high_level_summary_in_walkthrough: false
+  changed_files_summary: false
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  # No status noise
+  review_status: false
+  review_info: false
+  review_details: false
+  review_progress: false
+  collapse_walkthrough: true
+  in_progress_fortune: false
+  poem: false
+  # No issue/PR cross-referencing, labels, reviewers
+  assess_linked_issues: false
+  related_issues: false
+  related_prs: false
+  suggested_labels: false
+  auto_apply_labels: false
+  suggested_reviewers: false
+  auto_assign_reviewers: false
+  enable_prompt_for_ai_agents: false
+  slop_detection:
+    enabled: false
+  pre_merge_checks:
+    title:
+      mode: "off"
+    description:
+      mode: "off"
+    issue_assessment:
+      mode: "off"
+  finishing_touches:
+    unit_tests:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    simplify:
+      enabled: false
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+issue_enrichment:
+  auto_enrich:
+    enabled: false
+  planning:
+    enabled: false
+    auto_planning:
+      enabled: false
