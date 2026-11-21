@@ -6,12 +6,12 @@
 //! and certificate store, so corporate root CAs and proxies just work.
 
 use crate::checksum::{Algo, Hasher};
-use crate::util::format_bytes;
 use anyhow::{Context, Result, bail};
-use std::io::{IsTerminal, Read, Write};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const USER_AGENT: &str = concat!("vmmbox/", env!("CARGO_PKG_VERSION"));
 
@@ -189,69 +189,39 @@ fn final_content_length(headers: &str) -> Option<u64> {
     })
 }
 
-/// Single-line progress bar on stderr; silent when stderr is not a terminal.
+/// Single-line progress bar on stderr; silent when it is not a terminal.
 struct Progress {
-    label: String,
-    total: Option<u64>,
-    enabled: bool,
-    start: Instant,
-    last_draw: Instant,
+    bar: ProgressBar,
 }
 
 impl Progress {
     fn new(label: &str, total: Option<u64>) -> Self {
-        let enabled = std::io::stderr().is_terminal();
-        if !enabled {
+        let total = total.filter(|&t| t > 0);
+        let bar = ProgressBar::with_draw_target(total, ProgressDrawTarget::stderr());
+        if bar.is_hidden() {
             eprintln!("Downloading {label}...");
         }
-        let now = Instant::now();
-        Self {
-            label: label.to_string(),
-            total,
-            enabled,
-            start: now,
-            last_draw: now - Duration::from_secs(1),
-        }
+        let template = match total {
+            Some(_) => {
+                "{msg:<20!} [{wide_bar:.cyan/blue}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12}"
+            }
+            None => "{msg} {bytes} {bytes_per_sec}",
+        };
+        bar.set_style(
+            ProgressStyle::with_template(template)
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("=> "),
+        );
+        bar.set_message(label.to_string());
+        Self { bar }
     }
 
     fn update(&mut self, done: u64) {
-        if !self.enabled || self.last_draw.elapsed() < Duration::from_millis(100) {
-            return;
-        }
-        self.last_draw = Instant::now();
-        let rate = done as f64 / self.start.elapsed().as_secs_f64().max(0.001);
-        let line = match self.total {
-            Some(total) if total > 0 => {
-                let frac = (done as f64 / total as f64).clamp(0.0, 1.0);
-                let width = 24;
-                let filled = (frac * width as f64) as usize;
-                format!(
-                    "{} [{}{}] {:>3.0}%  {} / {}  {}/s",
-                    self.label,
-                    "=".repeat(filled),
-                    " ".repeat(width - filled),
-                    frac * 100.0,
-                    format_bytes(done),
-                    format_bytes(total),
-                    format_bytes(rate as u64),
-                )
-            }
-            _ => format!(
-                "{}  {}  {}/s",
-                self.label,
-                format_bytes(done),
-                format_bytes(rate as u64)
-            ),
-        };
-        eprint!("\r\x1b[2K{line}");
-        let _ = std::io::stderr().flush();
+        self.bar.set_position(done);
     }
 
     fn finish(&mut self) {
-        if self.enabled {
-            eprint!("\r\x1b[2K");
-            let _ = std::io::stderr().flush();
-        }
+        self.bar.finish_and_clear();
     }
 }
 
